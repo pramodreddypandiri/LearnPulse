@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<!--
+  LearnPulse Extension Popup
+  chrome-extension/src/popup/popup.html
+
+  PURPOSE:
+    The popup that appears when the user clicks the extension icon.
+    Width is fixed at 340px (Chrome extension popup standard).
+
+  WHY PLAIN HTML (no React/Vue/Svelte)?
+    Extension popups don't need a framework. The popup UI is simple:
+    - Show a count
+    - Show a list of recent items
+    - Two buttons
+    Vanilla HTML + popup.ts (compiled by esbuild) is faster to load,
+    smaller bundle size, and simpler to maintain.
+
+  POPUP LIFECYCLE:
+    The popup HTML is loaded fresh every time the user opens it.
+    There's no persistent state in the popup — all data comes from
+    chrome.storage.local which popup.ts reads on load.
+    The popup is destroyed when the user clicks elsewhere.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LearnPulse</title>
+  <style>
+    /* ─── Reset & Base ─────────────────────────────────────────────────── */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      color: #1f2937;
+      background: #ffffff;
+      width: 340px;
+      min-height: 200px;
+    }
+
+    /* ─── Header ──────────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #f3f4f6;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .header-logo {
+      font-size: 20px;
+      line-height: 1;
+    }
+
+    .header-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #111827;
+    }
+
+    .header-date {
+      font-size: 11px;
+      color: #9ca3af;
+    }
+
+    /* ─── Stats Bar ──────────────────────────────────────────────────── */
+    .stats-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: #f9fafb;
+      border-bottom: 1px solid #f3f4f6;
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .stat-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: #4f46e5;
+      line-height: 1.1;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 1px;
+    }
+
+    .stat-divider {
+      width: 1px;
+      height: 28px;
+      background: #e5e7eb;
+    }
+
+    /* ─── Empty State ────────────────────────────────────────────────── */
+    .empty-state {
+      padding: 28px 16px;
+      text-align: center;
+      color: #6b7280;
+    }
+
+    .empty-state-icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+
+    .empty-state-title {
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 4px;
+    }
+
+    .empty-state-text {
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    /* ─── Entry List ─────────────────────────────────────────────────── */
+    .entries-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px 6px;
+    }
+
+    .entries-header-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .entries-list {
+      max-height: 180px;
+      overflow-y: auto;
+      padding: 0 12px;
+    }
+
+    .entry-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px 4px;
+      border-radius: 6px;
+      transition: background 0.1s;
+    }
+
+    .entry-item:hover {
+      background: #f9fafb;
+    }
+
+    .entry-icon {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 1px;
+      flex-shrink: 0;
+    }
+
+    .entry-source {
+      flex-shrink: 0;
+    }
+
+    .source-badge {
+      display: inline-block;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .source-google     { background: #fef3c7; color: #92400e; }
+    .source-perplexity { background: #ede9fe; color: #5b21b6; }
+    .source-history    { background: #f0fdf4; color: #166534; }
+
+    .entry-content {
+      flex: 1;
+      font-size: 12px;
+      color: #374151;
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .entry-time {
+      flex-shrink: 0;
+      font-size: 10px;
+      color: #d1d5db;
+    }
+
+    /* ─── Actions ────────────────────────────────────────────────────── */
+    .actions {
+      padding: 12px 16px;
+      border-top: 1px solid #f3f4f6;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .btn-primary {
+      width: 100%;
+      padding: 10px;
+      background: #4f46e5;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .btn-primary:hover {
+      background: #4338ca;
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-ghost {
+      width: 100%;
+      padding: 7px;
+      background: transparent;
+      color: #6b7280;
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.1s, color 0.1s;
+    }
+
+    .btn-ghost:hover {
+      background: #f9fafb;
+      color: #374151;
+    }
+
+    /* ─── Status Messages ────────────────────────────────────────────── */
+    .status-message {
+      padding: 8px 16px;
+      font-size: 12px;
+      text-align: center;
+      color: #6b7280;
+      background: #f9fafb;
+      border-top: 1px solid #f3f4f6;
+      display: none;
+    }
+
+    .status-message.visible {
+      display: block;
+    }
+
+    .status-message.success {
+      color: #065f46;
+      background: #ecfdf5;
+    }
+
+    .status-message.error {
+      color: #7f1d1d;
+      background: #fef2f2;
+    }
+
+    /* ─── Footer ─────────────────────────────────────────────────────── */
+    .footer {
+      padding: 8px 16px;
+      text-align: center;
+      border-top: 1px solid #f3f4f6;
+    }
+
+    .footer-text {
+      font-size: 10px;
+      color: #d1d5db;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <span class="header-logo">🧠</span>
+      <span class="header-title">LearnPulse</span>
+    </div>
+    <span class="header-date" id="header-date">Today</span>
+  </div>
+
+  <!-- Stats Bar (shown when entries exist) -->
+  <div class="stats-bar" id="stats-bar" style="display:none">
+    <div class="stat">
+      <span class="stat-value" id="stat-searches">0</span>
+      <span class="stat-label">Searches</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-value" id="stat-urls">0</span>
+      <span class="stat-label">URLs</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-value" id="stat-total">0</span>
+      <span class="stat-label">Total</span>
+    </div>
+  </div>
+
+  <!-- Empty State (shown when no entries) -->
+  <div class="empty-state" id="empty-state">
+    <div class="empty-state-icon">🔍</div>
+    <div class="empty-state-title">Nothing captured yet</div>
+    <div class="empty-state-text">
+      Search something on Google or Perplexity<br>
+      and it will appear here automatically.
+    </div>
+  </div>
+
+  <!-- Entry List -->
+  <div id="entries-section" style="display:none">
+    <div class="entries-header">
+      <span class="entries-header-label">Recent captures</span>
+    </div>
+    <div class="entries-list" id="entries-list">
+      <!-- Entries injected by popup.ts -->
+    </div>
+  </div>
+
+  <!-- Status Message (shown during "Analyze Now" flow) -->
+  <div class="status-message" id="status-message"></div>
+
+  <!-- Action Buttons -->
+  <div class="actions" id="actions" style="display:none">
+    <!--
+      Single CTA: "Open LearnPulse"
+      Clicking this opens the web app tab and injects today's captured
+      entries so the user can review and delete them before analyzing.
+      The analysis itself is triggered inside the web app, not the popup.
+    -->
+    <button class="btn-primary" id="btn-open-app">
+      <span>🧠</span>
+      <span id="btn-open-app-label">Open LearnPulse</span>
+    </button>
+    <button class="btn-ghost" id="btn-clear">Clear today</button>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="footer-text">Data stays in your browser · Never uploaded</span>
+  </div>
+
+  <!-- popup.js compiled from popup.ts by esbuild -->
+  <script src="popup.js"></script>
+</body>
+</html>

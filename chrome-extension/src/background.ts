@@ -1,0 +1,382 @@
+// ══════════════════════════════════════════════════════════════════════
+// Background Service Worker
+// chrome-extension/src/background.ts
+//
+// PURPOSE:
+//   The "brain" of the extension that runs in Chrome's background.
+//   It handles operations that no content script or popup can do:
+//
+//   1. HISTORY BACKFILL — On startup, reads today's visited URLs from
+//      chrome.history API and saves them to storage as 'visit' entries.
+//      This catches any browsing that happened before the extension was
+//      installed, or before the content scripts loaded.
+//
+//   2. BADGE UPDATE — Keeps the extension icon badge showing the count
+//      of today's captured entries. This gives the user a at-a-glance
+//      indicator ("47") that learning is being tracked.
+//
+//   3. DAILY ALARMS — Sets up two alarms:
+//      a. Midnight reset: clear yesterday's entries
+//      b. 9pm reminder: "Ready to generate your learning post?"
+//
+//   4. NOTIFICATIONS — Shows the 9pm browser notification that links
+//      the user back to the extension popup.
+//
+// WHY A SERVICE WORKER (not a background page)?
+//   Manifest V3 replaced persistent background pages with service workers.
+//   Service workers start when needed (event received) and stop when idle.
+//   This is more battery and memory efficient, but it means:
+//   - NO in-memory state — everything must be in chrome.storage
+//   - We can't rely on setInterval — use chrome.alarms instead
+//   - The service worker might not be running when content scripts fire
+//     (content scripts talk to storage directly, not via message passing)
+//
+// HOW TO DEBUG THE SERVICE WORKER:
+//   Open chrome://extensions → find LearnPulse → click "Service Worker"
+//   This opens the DevTools console for the background script.
+// ══════════════════════════════════════════════════════════════════════
+
+import { readStorage, appendEntry, getTodayString, STORAGE_KEY, DailyStorage, CapturedEntry } from './types';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/** How many days back to include in the history backfill */
+const HISTORY_DAYS_BACK = 1; // Just today
+
+/** Maximum number of URLs to fetch from chrome.history per backfill */
+const HISTORY_MAX_RESULTS = 300;
+
+/** Alarm name for midnight reset */
+const ALARM_MIDNIGHT_RESET = 'learnpulse_midnight_reset';
+
+/** Alarm name for the 9pm reminder notification */
+const ALARM_EVENING_REMINDER = 'learnpulse_evening_reminder';
+
+// ─── Extension Install / Update ───────────────────────────────────────────────
+
+/**
+ * Fires when the extension is first installed OR updated.
+ *
+ * This is the best place to:
+ * 1. Backfill today's history (new install = no history captured yet)
+ * 2. Set up recurring alarms (they persist even when SW is idle)
+ * 3. Initialize storage with today's empty state
+ */
+chrome.runtime.onInstalled.addListener(async (details) => {
+  console.log('[LearnPulse] Extension installed/updated:', details.reason);
+
+  // Initialize storage for today if not already done
+  const storage = await readStorage();
+  await chrome.storage.local.set({ [STORAGE_KEY]: storage });
+
+  // Backfill today's history from chrome.history API
+  await backfillHistory();
+
+  // Set up daily alarms
+  await setupAlarms();
+
+  // Update the badge immediately
+  await updateBadge();
+});
+
+// ─── Startup ─────────────────────────────────────────────────────────────────
+
+/**
+ * Fires each time Chrome starts (or the extension is re-enabled after being disabled).
+ *
+ * The service worker doesn't persist between Chrome sessions, so alarms
+ * need to be re-checked and re-created on startup.
+ */
+chrome.runtime.onStartup.addListener(async () => {
+  console.log('[LearnPulse] Extension started');
+
+  // Re-check and update today's storage (handles day change during Chrome restart)
+  await readStorage(); // This also handles the daily reset via date comparison
+
+  // Re-create alarms if they were cleared (Chrome sometimes clears alarms on update)
+  await setupAlarms();
+
+  // Update badge with today's count
+  await updateBadge();
+
+  // Backfill any history from the current browser session
+  await backfillHistory();
+});
+
+// ─── History Backfill ─────────────────────────────────────────────────────────
+
+/**
+ * Reads today's visited URLs from chrome.history and saves them to storage.
+ *
+ * WHY BACKFILL?
+ * Content scripts only capture searches from Google/Perplexity. But the
+ * user also visits many educational URLs directly (documentation, GitHub repos,
+ * Stack Overflow). The chrome.history API gives us all visited URLs.
+ *
+ * We only take URLs from today (not past days) to keep the learning signal
+ * relevant and focused on the current day's activity.
+ *
+ * HOW chrome.history.search() WORKS:
+ * - Returns HistoryItem[] for URLs visited within the time range
+ * - Each HistoryItem has: id, url, title, lastVisitTime, visitCount
+ * - 'text' parameter filters by URL/title matching — empty string = all URLs
+ * - We request MAX_RESULTS URLs and sort by most recent first
+ */
+async function backfillHistory(): Promise<void> {
+  const todayStart = getTodayStartTimestamp();
+
+  let historyItems: chrome.history.HistoryItem[];
+  try {
+    historyItems = await chrome.history.search({
+      text: '',                          // No text filter — get everything
+      startTime: todayStart,             // From midnight today
+      maxResults: HISTORY_MAX_RESULTS,   // Cap to avoid overwhelming storage
+    });
+  } catch (error) {
+    console.error('[LearnPulse] Failed to read history:', error);
+    return;
+  }
+
+  console.log(`[LearnPulse] History backfill: found ${historyItems.length} items`);
+
+  let addedCount = 0;
+  for (const item of historyItems) {
+    if (!item.url) continue;
+
+    // Skip non-http URLs (chrome://, file://, data:, etc.)
+    if (!item.url.startsWith('http')) continue;
+
+    // Skip search result pages from Google/Bing — we capture those as 'search' entries
+    // via content scripts. Including them here would create duplicates.
+    if (isSearchResultPage(item.url)) continue;
+
+    const entry: CapturedEntry = {
+      type: 'visit',
+      content: item.url,
+      source: 'history',
+      timestamp: item.lastVisitTime ?? Date.now(),
+      title: item.title || undefined,
+    };
+
+    await appendEntry(entry);
+    addedCount++;
+  }
+
+  console.log(`[LearnPulse] Added ${addedCount} history entries to storage`);
+  await updateBadge();
+}
+
+/**
+ * Returns the Unix timestamp (ms) for the start of today (midnight local time).
+ * Used as the startTime for chrome.history.search().
+ */
+function getTodayStartTimestamp(): number {
+  const now = new Date();
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  return midnight.getTime();
+}
+
+/**
+ * Returns true if a URL is a search results page (should be captured as 'search' not 'visit').
+ * We skip these in history backfill to avoid duplicating content-script captures.
+ */
+function isSearchResultPage(url: string): boolean {
+  const SEARCH_PATTERNS = [
+    'google.com/search',
+    'bing.com/search',
+    'duckduckgo.com/?q=',
+    'perplexity.ai/search',
+    'search.yahoo.com/search',
+  ];
+  return SEARCH_PATTERNS.some((pattern) => url.includes(pattern));
+}
+
+// ─── Badge Management ─────────────────────────────────────────────────────────
+
+/**
+ * Updates the extension icon badge to show today's entry count.
+ *
+ * The badge is the small number shown on the extension icon in the toolbar.
+ * It gives the user an at-a-glance "47 things captured today" indicator
+ * without needing to open the popup.
+ *
+ * Badge appearance:
+ * - 0 entries:  no badge (empty — indicates nothing captured yet today)
+ * - 1-99:       shows the exact count
+ * - 100+:       shows "99+" (badge has limited space)
+ */
+async function updateBadge(): Promise<void> {
+  const storage = await readStorage();
+  const count = storage.entries.length;
+
+  if (count === 0) {
+    // Clear the badge when there are no entries
+    await chrome.action.setBadgeText({ text: '' });
+    return;
+  }
+
+  const badgeText = count > 99 ? '99+' : String(count);
+
+  await chrome.action.setBadgeText({ text: badgeText });
+
+  // Indigo background to match the LearnPulse brand
+  await chrome.action.setBadgeBackgroundColor({ color: '#4F46E5' });
+}
+
+// ─── Alarm Setup ─────────────────────────────────────────────────────────────
+
+/**
+ * Sets up the two daily alarms:
+ * 1. Midnight reset alarm — fires at 12:00:00 AM to clear yesterday's entries
+ * 2. Evening reminder alarm — fires at 9:00 PM to prompt the user
+ *
+ * WHY ALARMS INSTEAD OF setTimeout?
+ * - Service workers are killed when idle (typically 30 seconds after last event)
+ * - setTimeout would be lost when the SW is killed
+ * - chrome.alarms survive the SW being killed — Chrome wakes up the SW when the alarm fires
+ * - Alarms also survive Chrome restart (if Chrome is restarted, alarms re-fire at the next scheduled time)
+ */
+async function setupAlarms(): Promise<void> {
+  // Check if alarms already exist to avoid re-creating them
+  const existingAlarms = await chrome.alarms.getAll();
+  const alarmNames = existingAlarms.map((a) => a.name);
+
+  // Midnight reset alarm
+  if (!alarmNames.includes(ALARM_MIDNIGHT_RESET)) {
+    const nextMidnight = getNextMidnight();
+    chrome.alarms.create(ALARM_MIDNIGHT_RESET, {
+      when: nextMidnight,
+      periodInMinutes: 24 * 60, // Repeat every 24 hours
+    });
+    console.log('[LearnPulse] Midnight reset alarm scheduled');
+  }
+
+  // Evening reminder alarm (9:00 PM)
+  if (!alarmNames.includes(ALARM_EVENING_REMINDER)) {
+    const next9pm = getNext9pm();
+    chrome.alarms.create(ALARM_EVENING_REMINDER, {
+      when: next9pm,
+      periodInMinutes: 24 * 60, // Repeat every 24 hours
+    });
+    console.log('[LearnPulse] Evening reminder alarm scheduled');
+  }
+}
+
+/**
+ * Returns the Unix timestamp for the next midnight (12:00 AM).
+ */
+function getNextMidnight(): number {
+  const now = new Date();
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
+  return midnight.getTime();
+}
+
+/**
+ * Returns the Unix timestamp for the next 9:00 PM.
+ * If it's already past 9pm today, returns 9pm tomorrow.
+ */
+function getNext9pm(): number {
+  const now = new Date();
+  const ninepm = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 21, 0, 0, 0);
+
+  // If 9pm today has already passed, schedule for tomorrow
+  if (ninepm.getTime() <= Date.now()) {
+    ninepm.setDate(ninepm.getDate() + 1);
+  }
+
+  return ninepm.getTime();
+}
+
+// ─── Alarm Handler ────────────────────────────────────────────────────────────
+
+/**
+ * Handles alarm events when they fire.
+ *
+ * Chrome wakes up the service worker specifically to fire this event.
+ * After handling, the SW may go back to sleep.
+ */
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  console.log('[LearnPulse] Alarm fired:', alarm.name);
+
+  if (alarm.name === ALARM_MIDNIGHT_RESET) {
+    await handleMidnightReset();
+  } else if (alarm.name === ALARM_EVENING_REMINDER) {
+    await handleEveningReminder();
+  }
+});
+
+/**
+ * Midnight reset: archive yesterday's data, initialize today's fresh storage.
+ *
+ * We don't actually delete old data — we just set the date to today so
+ * readStorage() will return a fresh empty state. This means yesterday's data
+ * is effectively gone (overwritten on next write). This is intentional:
+ * LearnPulse is privacy-first — we don't accumulate history over time.
+ */
+async function handleMidnightReset(): Promise<void> {
+  const freshStorage: DailyStorage = {
+    date: getTodayString(),
+    entries: [],
+  };
+  await chrome.storage.local.set({ [STORAGE_KEY]: freshStorage });
+  await updateBadge(); // Clear the badge
+  console.log('[LearnPulse] Daily reset complete');
+}
+
+/**
+ * Evening reminder: shows a browser notification to prompt the user
+ * to open LearnPulse and generate today's learning post.
+ */
+async function handleEveningReminder(): Promise<void> {
+  const storage = await readStorage();
+  const count = storage.entries.length;
+
+  // Only show notification if there's something to analyze
+  if (count === 0) return;
+
+  chrome.notifications.create('learnpulse_reminder', {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'LearnPulse 🧠',
+    message: `You captured ${count} learning signals today. Ready to generate your post?`,
+    buttons: [{ title: 'Analyze Now' }],
+    priority: 1,
+  });
+}
+
+// ─── Notification Click Handler ───────────────────────────────────────────────
+
+/**
+ * When the user clicks the notification (or its "Analyze Now" button),
+ * open the LearnPulse web app tab.
+ */
+chrome.notifications.onClicked.addListener((notificationId) => {
+  if (notificationId === 'learnpulse_reminder') {
+    chrome.tabs.create({ url: 'http://localhost:3000' });
+    chrome.notifications.clear(notificationId);
+  }
+});
+
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  if (notificationId === 'learnpulse_reminder' && buttonIndex === 0) {
+    chrome.tabs.create({ url: 'http://localhost:3000' });
+    chrome.notifications.clear(notificationId);
+  }
+});
+
+// ─── Storage Change Listener ─────────────────────────────────────────────────
+
+/**
+ * Listens for changes to chrome.storage.local.
+ * When entries are added by content scripts, update the badge count.
+ *
+ * WHY LISTEN HERE INSTEAD OF IN CONTENT SCRIPTS?
+ * Content scripts run in page contexts (potentially many tabs open at once).
+ * Updating the badge should be centralized in the service worker — it's
+ * the single authority for the badge value.
+ */
+chrome.storage.onChanged.addListener(async (changes, area) => {
+  if (area === 'local' && changes[STORAGE_KEY]) {
+    await updateBadge();
+  }
+});
