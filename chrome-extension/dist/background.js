@@ -12,6 +12,12 @@ async function readStorage() {
   }
   return stored;
 }
+var WEB_APP_LS_KEY = "learnpulse_entries";
+function formatEntriesAsText(entries) {
+  const searches = entries.filter((e) => e.type === "search").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
+  const urls = entries.filter((e) => e.type === "visit").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
+  return [...searches, ...urls].filter(Boolean).join("\n");
+}
 async function appendEntry(entry) {
   const storage = await readStorage();
   const ONE_HOUR_MS = 60 * 60 * 1e3;
@@ -24,6 +30,7 @@ async function appendEntry(entry) {
 }
 
 // src/background.ts
+var LEARNPULSE_URL = "http://localhost:3000";
 var HISTORY_MAX_RESULTS = 300;
 var ALARM_MIDNIGHT_RESET = "learnpulse_midnight_reset";
 var ALARM_EVENING_REMINDER = "learnpulse_evening_reminder";
@@ -178,6 +185,35 @@ chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) =
   if (notificationId === "learnpulse_reminder" && buttonIndex === 0) {
     chrome.tabs.create({ url: "http://localhost:3000" });
     chrome.notifications.clear(notificationId);
+  }
+});
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  if (!tab.url?.startsWith(LEARNPULSE_URL)) return;
+  const storage = await readStorage();
+  if (!storage.entries.length) return;
+  const text = formatEntriesAsText(storage.entries);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      // This inline function runs INSIDE the LearnPulse page's JS context.
+      // It receives the text and lsKey as serialized arguments from background.
+      // It cannot import anything — it must be self-contained.
+      func: (textToInject, lsKey) => {
+        try {
+          localStorage.setItem(lsKey, JSON.stringify({ text: textToInject, savedAt: Date.now() }));
+        } catch (e) {
+        }
+        window.dispatchEvent(new CustomEvent("learnpulse:inject", {
+          detail: { text: textToInject }
+        }));
+      },
+      args: [text, WEB_APP_LS_KEY],
+      world: "MAIN"
+    });
+    console.log("[LearnPulse] Auto-injected", storage.entries.length, "entries into LearnPulse tab on load");
+  } catch (error) {
+    console.log("[LearnPulse] Could not auto-inject into tab (may be normal):", error);
   }
 });
 chrome.storage.onChanged.addListener(async (changes, area) => {

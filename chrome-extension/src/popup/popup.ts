@@ -47,7 +47,7 @@
 //   and more reliable for one-time data injection.
 // ══════════════════════════════════════════════════════════════════════
 
-import { readStorage, CapturedEntry, STORAGE_KEY, getTodayString } from '../types';
+import { readStorage, CapturedEntry, STORAGE_KEY, getTodayString, formatEntriesAsText, WEB_APP_LS_KEY } from '../types';
 
 // ─── LearnPulse Web App URL ──────────────────────────────────────────────────
 // This URL is used to open/focus the LearnPulse tab.
@@ -237,12 +237,29 @@ async function handleOpenLearnPulse(): Promise<void> {
     showStatus('Sending your captures...', 'default');
 
     // Inject the data into the LearnPulse page.
-    // The injected function runs in the web app's context and dispatches
-    // a CustomEvent that page.tsx listens for.
+    //
+    // CRITICAL: world: 'MAIN'
+    //   Chrome MV3 executeScript defaults to world: 'ISOLATED' — a separate
+    //   JavaScript context from the page. In isolated world:
+    //     • window.dispatchEvent() works (DOM events DO cross worlds)
+    //     • window.__learnpulseInjectData = ... does NOT (different window object)
+    //
+    //   By specifying world: 'MAIN', the injected function runs in the SAME
+    //   JavaScript context as the React/Next.js app. This means:
+    //     • window.__learnpulseInjectData is visible to React's useEffect ✓
+    //     • window.dispatchEvent() targets the same listeners React registered ✓
+    //
+    //   Without world: 'MAIN', the fallback variable is invisible to React and
+    //   the event may be caught, but the variable-based fallback for hydration
+    //   race conditions cannot work.
+    // Pass WEB_APP_LS_KEY as the second arg so the injected function can
+    // write to localStorage. We can't import constants inside executeScript
+    // functions (they run in the page context), so we pass it as a parameter.
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: injectHistoryIntoWebApp,
-      args: [formattedText],
+      args: [formattedText, WEB_APP_LS_KEY],
+      world: 'MAIN',
     });
 
     // Close the popup — user continues in the web app's entry review panel
@@ -257,37 +274,6 @@ async function handleOpenLearnPulse(): Promise<void> {
     if (openBtn) openBtn.disabled = false;
     if (openLabel) openLabel.textContent = 'Open LearnPulse';
   }
-}
-
-/**
- * Formats CapturedEntry[] as freeform text for the LearnPulse web app.
- *
- * Format: one entry per line
- * - Search entries: just the query text
- * - URL entries: the URL
- *
- * Searches come first (highest learning signal), then URLs.
- * Sorted chronologically within each group (oldest first = natural reading order).
- *
- * WHY THIS FORMAT?
- * The web app's freeform parser (src/lib/parsers/freeform-parser.ts) handles
- * this exact format: lines starting with "http" become 'visit' entries,
- * everything else becomes 'search' entries. This creates a clean round-trip:
- *   CapturedEntry[] → formatted text → HistoryEntry[] (in the web app)
- */
-function formatEntriesAsText(entries: CapturedEntry[]): string {
-  const searches = entries
-    .filter((e) => e.type === 'search')
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map((e) => e.content);
-
-  const urls = entries
-    .filter((e) => e.type === 'visit')
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map((e) => e.content);
-
-  const lines = [...searches, ...urls];
-  return lines.join('\n');
 }
 
 // ─── Tab Management ───────────────────────────────────────────────────────────
@@ -370,33 +356,58 @@ async function waitForTabLoad(tabId: number): Promise<void> {
  *
  * @param text - The formatted history text (one entry per line)
  */
-function injectHistoryIntoWebApp(text: string): void {
-  // ── Store-then-dispatch pattern ───────────────────────────────────────────
-  //
-  // PROBLEM: CustomEvent dispatch is instant, but React's useEffect (which
-  // registers the listener) only runs AFTER the component mounts and
-  // Next.js has fully hydrated. On a fresh page load this takes 1-3 seconds.
-  // If we only dispatch the event, there's a window where no listener exists
-  // yet and the event fires into the void.
-  //
-  // FIX: Store the data in window.__learnpulseInjectData BEFORE dispatching.
-  // React's useEffect reads this variable on mount and processes any data
-  // that arrived before the listener was registered.
-  // The variable is deleted after the data is consumed (no memory leak).
-  //
-  // This creates two paths to success:
-  //   Path A (listener ready): useEffect already registered → event fires → listener handles it
-  //   Path B (listener not ready yet): event fires → missed → useEffect mounts → checks variable → handles it
-  (window as unknown as Record<string, unknown>)['__learnpulseInjectData'] = { text };
+function injectHistoryIntoWebApp(text: string, lsKey: string): void {
+  const DATA_KEY = '__learnpulseInjectData';
+  const EVENT_NAME = 'learnpulse:inject';
 
-  // Also dispatch the event for Path A (already-loaded pages)
-  window.dispatchEvent(
-    new CustomEvent('learnpulse:inject', {
-      detail: { text },
-    })
-  );
+  // ── Persist to localStorage so refresh works without re-injection ──────────
+  //
+  // WHY localStorage?
+  //   The extension can only inject data when the popup is open (or when the
+  //   background script fires onUpdated). If the user refreshes the LearnPulse
+  //   tab manually, neither of those happens automatically for the popup path.
+  //   Persisting to localStorage means the web app's useEffect can read the
+  //   data on every mount, regardless of how the page was opened.
+  //
+  //   The web app checks { savedAt } against today's date before using the
+  //   data — so stale entries from yesterday are automatically ignored.
+  //
+  // NOTE: This runs in MAIN world (world:'MAIN' in executeScript), so
+  // localStorage here is the LearnPulse tab's own localStorage — exactly
+  // the same storage that page.tsx reads from.
+  try {
+    localStorage.setItem(lsKey, JSON.stringify({ text, savedAt: Date.now() }));
+  } catch (e) {
+    // Ignore — localStorage unavailable in some edge cases
+  }
 
-  console.log('[LearnPulse Extension] Injected history data into web app');
+  // ── Store the data in window (MAIN world — same JS context as React) ──────
+  //
+  // This is the in-memory fallback for when the event fires before React's
+  // useEffect has run and registered its listener. React's useEffect checks
+  // for this variable on mount and processes it if found.
+  (window as Record<string, unknown>)[DATA_KEY] = { text };
+
+  // ── Dispatch function — only fires if data hasn't been consumed yet ────────
+  //
+  // React's processInjectedText deletes the DATA_KEY variable when it runs.
+  // Once React picks up the data (via any path), subsequent retries see the
+  // key is gone and silently no-op. No duplicate processing.
+  function tryDispatch() {
+    if (!(DATA_KEY in window)) return; // already consumed by React — stop
+    window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: { text } }));
+  }
+
+  // ── Attempt 1: Immediate (handles already-hydrated pages) ─────────────────
+  tryDispatch();
+
+  // ── Attempts 2-4: Retry at increasing intervals ────────────────────────────
+  // For fresh page loads, Next.js needs 1-3 seconds to hydrate.
+  setTimeout(tryDispatch, 800);   // 0.8s — catches most fast hydrations
+  setTimeout(tryDispatch, 2000);  // 2.0s — catches slower/cold starts
+  setTimeout(tryDispatch, 4000);  // 4.0s — last resort for very slow machines
+
+  console.log('[LearnPulse Extension] Injected history data into web app (world: MAIN)');
 }
 
 // ─── Clear Handler ────────────────────────────────────────────────────────────

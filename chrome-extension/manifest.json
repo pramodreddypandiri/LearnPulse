@@ -38,6 +38,11 @@
       ],
       "js": ["dist/content-perplexity.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://localhost:3000/*"],
+      "js": ["dist/content-learnpulse.js"],
+      "run_at": "document_idle"
     }
   ],
 

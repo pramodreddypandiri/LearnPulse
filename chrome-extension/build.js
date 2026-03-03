@@ -92,6 +92,7 @@ async function build() {
       entryPoints: {
         'dist/content-google':      'src/content-google.ts',
         'dist/content-perplexity':  'src/content-perplexity.ts',
+        'dist/content-learnpulse':  'src/content-learnpulse.ts',
         'dist/popup/popup':         'src/popup/popup.ts',
       },
       outdir: '.',

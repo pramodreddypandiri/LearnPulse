@@ -14,6 +14,12 @@
     }
     return stored;
   }
+  var WEB_APP_LS_KEY = "learnpulse_entries";
+  function formatEntriesAsText(entries) {
+    const searches = entries.filter((e) => e.type === "search").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
+    const urls = entries.filter((e) => e.type === "visit").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
+    return [...searches, ...urls].filter(Boolean).join("\n");
+  }
 
   // src/popup/popup.ts
   var LEARNPULSE_URL = "http://localhost:3000";
@@ -105,7 +111,8 @@
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: injectHistoryIntoWebApp,
-        args: [formattedText]
+        args: [formattedText, WEB_APP_LS_KEY],
+        world: "MAIN"
       });
       setTimeout(() => window.close(), 800);
     } catch (error) {
@@ -117,12 +124,6 @@
       if (openBtn) openBtn.disabled = false;
       if (openLabel) openLabel.textContent = "Open LearnPulse";
     }
-  }
-  function formatEntriesAsText(entries) {
-    const searches = entries.filter((e) => e.type === "search").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
-    const urls = entries.filter((e) => e.type === "visit").sort((a, b) => a.timestamp - b.timestamp).map((e) => e.content);
-    const lines = [...searches, ...urls];
-    return lines.join("\n");
   }
   async function openOrFocusLearnPulseTab() {
     const existingTabs = await chrome.tabs.query({ url: `${LEARNPULSE_URL}/*` });
@@ -154,14 +155,23 @@
       chrome.tabs.onUpdated.addListener(listener);
     });
   }
-  function injectHistoryIntoWebApp(text) {
-    window["__learnpulseInjectData"] = { text };
-    window.dispatchEvent(
-      new CustomEvent("learnpulse:inject", {
-        detail: { text }
-      })
-    );
-    console.log("[LearnPulse Extension] Injected history data into web app");
+  function injectHistoryIntoWebApp(text, lsKey) {
+    const DATA_KEY = "__learnpulseInjectData";
+    const EVENT_NAME = "learnpulse:inject";
+    try {
+      localStorage.setItem(lsKey, JSON.stringify({ text, savedAt: Date.now() }));
+    } catch (e) {
+    }
+    window[DATA_KEY] = { text };
+    function tryDispatch() {
+      if (!(DATA_KEY in window)) return;
+      window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: { text } }));
+    }
+    tryDispatch();
+    setTimeout(tryDispatch, 800);
+    setTimeout(tryDispatch, 2e3);
+    setTimeout(tryDispatch, 4e3);
+    console.log("[LearnPulse Extension] Injected history data into web app (world: MAIN)");
   }
   async function handleClear() {
     const confirmed = confirm(

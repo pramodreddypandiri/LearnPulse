@@ -135,6 +135,55 @@ export async function readStorage(): Promise<DailyStorage> {
   return stored;
 }
 
+// ─── localStorage Bridge Key ──────────────────────────────────────────────────
+
+/**
+ * The key used to persist formatted entry text in the LearnPulse tab's
+ * localStorage. This is the bridge that makes the two-panel view persist
+ * across page refreshes.
+ *
+ * HOW THE BRIDGE WORKS:
+ *   1. Extension popup / background script runs executeScript() with world:'MAIN'
+ *   2. The injected function writes localStorage.setItem(WEB_APP_LS_KEY, ...)
+ *      into the LearnPulse tab's own localStorage
+ *   3. On every page load, page.tsx reads this key in its useEffect
+ *   4. If data is found and from today, entries are parsed and shown immediately
+ *
+ * This decouples the refresh cycle from the extension: even if the extension
+ * is not actively injecting (user just refreshed), the data is already there.
+ */
+export const WEB_APP_LS_KEY = 'learnpulse_entries';
+
+// ─── Formatter (shared between popup + background) ────────────────────────────
+
+/**
+ * Formats CapturedEntry[] as freeform text for the LearnPulse web app.
+ *
+ * The web app's freeform parser (src/lib/parsers/freeform-parser.ts) reads
+ * this format: lines starting with "http" become 'visit' entries, everything
+ * else becomes 'search' entries. This creates a clean round-trip:
+ *   CapturedEntry[] → formatEntriesAsText → string → parseInput → HistoryEntry[]
+ *
+ * Searches come first (primary learning signal), URLs second (depth signal).
+ * Within each group, entries are sorted chronologically (oldest first).
+ *
+ * Previously this function lived only in popup.ts. Moving it here means
+ * background.ts can also use it for the tab onUpdated auto-inject flow.
+ */
+export function formatEntriesAsText(entries: CapturedEntry[]): string {
+  const searches = entries
+    .filter((e) => e.type === 'search')
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((e) => e.content);
+
+  const urls = entries
+    .filter((e) => e.type === 'visit')
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((e) => e.content);
+
+  return [...searches, ...urls].filter(Boolean).join('\n');
+}
+
 /**
  * Appends a new entry to today's storage.
  * Handles date-change detection and deduplication automatically.

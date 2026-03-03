@@ -36,9 +36,16 @@
 //   This opens the DevTools console for the background script.
 // ══════════════════════════════════════════════════════════════════════
 
-import { readStorage, appendEntry, getTodayString, STORAGE_KEY, DailyStorage, CapturedEntry } from './types';
+import { readStorage, appendEntry, getTodayString, STORAGE_KEY, DailyStorage, CapturedEntry, formatEntriesAsText, WEB_APP_LS_KEY } from './types';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * The LearnPulse web app URL.
+ * The onUpdated listener watches for this URL to auto-inject entries
+ * whenever the tab loads or refreshes. Change this for production deploys.
+ */
+const LEARNPULSE_URL = 'http://localhost:3000';
 
 /** How many days back to include in the history backfill */
 const HISTORY_DAYS_BACK = 1; // Just today
@@ -361,6 +368,99 @@ chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) =
   if (notificationId === 'learnpulse_reminder' && buttonIndex === 0) {
     chrome.tabs.create({ url: 'http://localhost:3000' });
     chrome.notifications.clear(notificationId);
+  }
+});
+
+// ─── LearnPulse Tab Auto-Inject ───────────────────────────────────────────────
+
+/**
+ * Watches for the LearnPulse tab to load or refresh.
+ * When detected, injects today's entries directly into the tab so the
+ * two-panel view auto-populates without the user needing to open the popup.
+ *
+ * WHY THIS IS NEEDED:
+ *   Without this listener, the left panel only populates when the user
+ *   explicitly clicks "Open LearnPulse" in the popup. If the user:
+ *     - Opens the web app directly (bookmark, typing the URL)
+ *     - Refreshes the page
+ *     - Navigates back to the tab
+ *   ...the panel would be empty unless the popup re-injects the data.
+ *
+ * HOW IT WORKS:
+ *   1. chrome.tabs.onUpdated fires whenever any tab's status changes
+ *   2. We filter for the LearnPulse URL with status === 'complete'
+ *      (status goes loading → complete as the page finishes loading)
+ *   3. We read today's entries from chrome.storage.local
+ *   4. We inject a small script (world: 'MAIN') into the tab that:
+ *      a. Writes entries to localStorage (so future refreshes also work)
+ *      b. Dispatches 'learnpulse:inject' event (for immediate pickup by React)
+ *
+ * THE localStorage BRIDGE:
+ *   The injected script writes to the tab's own localStorage. On every page
+ *   load, page.tsx reads this localStorage key in its useEffect. This means:
+ *   - First load: background injects → localStorage written → React reads it
+ *   - Second load (refresh): background injects again → same thing
+ *   Even if the background script's executeScript fails (permissions, timing),
+ *   the localStorage from the previous injection is still there as a fallback.
+ *
+ * TIMING:
+ *   status === 'complete' fires when the HTML is loaded but React may still
+ *   be hydrating. The injected script writes to localStorage immediately
+ *   (so useEffect can read it on mount) and also dispatches an event
+ *   (caught by useEffect's listener if React hydrated in time).
+ */
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  // Only act when the tab fully finishes loading
+  if (changeInfo.status !== 'complete') return;
+
+  // Only act on the LearnPulse web app tab
+  if (!tab.url?.startsWith(LEARNPULSE_URL)) return;
+
+  // Read today's captured entries
+  const storage = await readStorage();
+  if (!storage.entries.length) return; // Nothing to inject — leave the tab alone
+
+  // Format entries as the freeform text the web app parser expects
+  const text = formatEntriesAsText(storage.entries);
+
+  try {
+    // Inject into the LearnPulse tab's MAIN world so localStorage and
+    // window are the same objects that React/Next.js uses.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      // This inline function runs INSIDE the LearnPulse page's JS context.
+      // It receives the text and lsKey as serialized arguments from background.
+      // It cannot import anything — it must be self-contained.
+      func: (textToInject: string, lsKey: string) => {
+        // Write to localStorage first — this is the reliable bridge.
+        // Even if the CustomEvent is missed (React not hydrated yet),
+        // the web app's useEffect will read localStorage on mount.
+        try {
+          localStorage.setItem(lsKey, JSON.stringify({ text: textToInject, savedAt: Date.now() }));
+        } catch (e) {
+          // Ignore — localStorage should always be available on localhost
+        }
+
+        // Also dispatch the real-time event for pages that are already loaded.
+        // (Covers the case where the user has the tab open and navigates away
+        // and back, triggering onUpdated for an already-hydrated page.)
+        window.dispatchEvent(new CustomEvent('learnpulse:inject', {
+          detail: { text: textToInject },
+        }));
+      },
+      args: [text, WEB_APP_LS_KEY],
+      world: 'MAIN',
+    });
+
+    console.log('[LearnPulse] Auto-injected', storage.entries.length, 'entries into LearnPulse tab on load');
+  } catch (error) {
+    // This can happen if:
+    // - The page navigated away between onUpdated firing and executeScript running
+    // - Scripting permissions aren't granted for this tab
+    // - The tab was closed
+    // All are transient — not worth retrying. The localStorage from a previous
+    // successful injection will still be available as a fallback.
+    console.log('[LearnPulse] Could not auto-inject into tab (may be normal):', error);
   }
 });
 
