@@ -80,11 +80,13 @@ export default function DashboardPage() {
   // When the Chrome extension injects history data, we switch to "extension mode":
   //   - isExtensionMode: true → show the two-panel layout
   //   - capturedEntries: the parsed HistoryEntry[] from the extension
+  //   - instructions: free-form text the user writes to guide post generation
   //
   // The user can delete individual entries from capturedEntries before
   // clicking "Analyze" — this lets them curate their learning signal.
   const [isExtensionMode, setIsExtensionMode] = useState(false);
   const [capturedEntries, setCapturedEntries] = useState<HistoryEntry[]>([]);
+  const [instructions, setInstructions] = useState('');
 
   // ── Chrome Extension Event Listener ──────────────────────────────────────────
   //
@@ -92,16 +94,23 @@ export default function DashboardPage() {
   //   1. User clicks "Open LearnPulse" in the extension popup
   //   2. Popup uses chrome.scripting.executeScript() to inject a function
   //      into this tab's context
-  //   3. The injected function dispatches:
-  //      window.dispatchEvent(new CustomEvent('learnpulse:inject', { detail: { text } }))
-  //   4. This useEffect catches that event
-  //   5. We parse the text into HistoryEntry[] and show the left panel
+  //   3. The injected function:
+  //      a. Stores the data: window.__learnpulseInjectData = { text }
+  //      b. Dispatches:      window.dispatchEvent(new CustomEvent('learnpulse:inject', ...))
+  //   4. This useEffect catches that event (if listener is ready) OR reads
+  //      window.__learnpulseInjectData on mount (if event fired first)
   //
-  // WHY PARSE HERE (not in the popup)?
-  //   The popup lives in the extension's isolated JS context. The web app
-  //   has access to parseInput() (which runs client-side). By passing raw
-  //   text across the boundary and parsing in the web app, we keep all
-  //   parsing logic in one place (src/lib/parsers/) and avoid duplicating it.
+  // RACE CONDITION FIX:
+  //   Problem: Next.js takes 1-3 seconds to hydrate after the HTML loads.
+  //   The extension may fire the CustomEvent BEFORE React's useEffect has run
+  //   and registered the event listener — causing the event to be missed entirely.
+  //
+  //   Fix (store-then-dispatch pattern):
+  //   - Extension stores data in window.__learnpulseInjectData before dispatching
+  //   - On mount, this useEffect checks for that variable first
+  //   - If data is already there (event fired before mount): process it immediately
+  //   - If data isn't there yet (normal case): event listener handles it when it fires
+  //   - Variable is deleted after consumption (avoids stale data on re-mount)
   //
   // WHY NO AUTO-ANALYZE?
   //   Previously, receiving this event auto-started the AI pipeline.
@@ -109,14 +118,14 @@ export default function DashboardPage() {
   //   to analyze and can remove entries (noise, private browsing) before
   //   spending API credits.
   useEffect(() => {
-    const handleExtensionInject = (e: Event) => {
-      const customEvent = e as CustomEvent<{ text: string }>;
-      const text = customEvent.detail?.text;
+    // Shared handler — processes the injected text regardless of which
+    // delivery path is used (event listener vs. preloaded variable)
+    const processInjectedText = (text: string) => {
       if (!text || typeof text !== 'string') return;
 
       // Parse the injected freeform text into structured HistoryEntry[].
       // Lines starting with "http" → { source: 'visit', url: ... }
-      // Everything else         → { source: 'search', query: ... }
+      // Everything else            → { source: 'search', query: ... }
       const { entries } = parseInput(text);
 
       // Switch to extension mode and populate the left panel
@@ -126,6 +135,21 @@ export default function DashboardPage() {
       // Also populate rawInput so the user can see the raw data if they
       // switch back to manual mode
       setRawInput(text);
+    };
+
+    // ── Path B: check for data that arrived before this useEffect ran ────────
+    // (Handles the race where the extension fired the event before React hydrated)
+    const win = window as unknown as Record<string, { text: string } | undefined>;
+    const preloaded = win['__learnpulseInjectData'];
+    if (preloaded?.text) {
+      processInjectedText(preloaded.text);
+      delete win['__learnpulseInjectData']; // consume and clear
+    }
+
+    // ── Path A: register the real-time event listener for future injections ──
+    const handleExtensionInject = (e: Event) => {
+      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      processInjectedText(text);
     };
 
     window.addEventListener('learnpulse:inject', handleExtensionInject);
@@ -190,8 +214,15 @@ export default function DashboardPage() {
       .map((e) => e.url || e.raw);
     const text = [...searches, ...urls].filter(Boolean).join('\n');
 
-    await runPipeline(text);
-  }, [capturedEntries, isRunning, runPipeline]);
+    // Pass user instructions as preferences — the post generator uses these
+    // to steer the tone, emphasis, and focus of the generated posts.
+    // If the user left instructions blank, we pass undefined (no override).
+    const preferences = instructions.trim()
+      ? { customInstructions: instructions.trim() }
+      : undefined;
+
+    await runPipeline(text, preferences);
+  }, [capturedEntries, isRunning, runPipeline, instructions]);
 
   /**
    * Resets both the pipeline and the extension mode state.
@@ -201,6 +232,7 @@ export default function DashboardPage() {
     reset();
     setCapturedEntries([]);
     setIsExtensionMode(false);
+    setInstructions('');
   }, [reset]);
 
   // ── Handlers — Manual Mode ────────────────────────────────────────────────────
@@ -273,16 +305,51 @@ export default function DashboardPage() {
             */}
             <div className="flex-1 min-w-0">
 
-              {/* Idle state: prompt the user to click Analyze */}
+              {/* Idle state: instructions input + prompt to click Analyze */}
+              {/*
+                This panel has two jobs when idle:
+                1. Let the user write free-form instructions for the AI
+                2. Show a hint pointing them to the Analyze button
+
+                The instructions are optional — if left blank, the AI uses
+                its default writing style. If filled in, the instructions
+                become a high-priority directive in the generation prompt.
+              */}
               {state.stage === 'idle' && (
-                <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-12 text-center">
-                  <p className="text-4xl mb-3">✨</p>
-                  <p className="text-sm font-medium text-gray-600 mb-1">
-                    Ready when you are
-                  </p>
-                  <p className="text-xs text-gray-400">
-                    Review your entries on the left, remove noise, then click{' '}
-                    <span className="font-medium">Analyze</span>.
+                <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+                  {/* Section label */}
+                  <div className="mb-3">
+                    <h3 className="text-sm font-semibold text-gray-700">
+                      Post instructions
+                      <span className="ml-2 text-xs font-normal text-gray-400">optional</span>
+                    </h3>
+                    <p className="text-xs text-gray-400 mt-0.5">
+                      Tell the AI how to write your post — topic focus, audience, tone, or specific things to include.
+                    </p>
+                  </div>
+
+                  {/*
+                    Instructions textarea.
+                    - resize-none prevents the user from resizing it (keeps layout stable)
+                    - Tailwind focus ring matches the app's indigo brand color
+                    - rows={5} gives enough room for a sentence or two
+                  */}
+                  <textarea
+                    value={instructions}
+                    onChange={(e) => setInstructions(e.target.value)}
+                    placeholder={
+                      'Examples:\n' +
+                      '• "Focus on the debugging journey, not the solution"\n' +
+                      '• "Write for a React developer audience"\n' +
+                      '• "Emphasize the production impact and what I learned about async I/O"'
+                    }
+                    rows={5}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm text-gray-700 placeholder-gray-300 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-shadow"
+                  />
+
+                  {/* Hint pointing to the Analyze button */}
+                  <p className="text-xs text-gray-300 mt-2 text-center">
+                    When ready, click <span className="font-medium text-gray-400">Analyze</span> in the left panel
                   </p>
                 </div>
               )}

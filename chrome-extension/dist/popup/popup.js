@@ -148,13 +148,14 @@
         if (updatedTabId === tabId && changeInfo.status === "complete") {
           clearTimeout(timeout);
           chrome.tabs.onUpdated.removeListener(listener);
-          setTimeout(resolve, 500);
+          setTimeout(resolve, 1500);
         }
       };
       chrome.tabs.onUpdated.addListener(listener);
     });
   }
   function injectHistoryIntoWebApp(text) {
+    window["__learnpulseInjectData"] = { text };
     window.dispatchEvent(
       new CustomEvent("learnpulse:inject", {
         detail: { text }
