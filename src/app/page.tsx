@@ -3,150 +3,176 @@
 // src/app/page.tsx
 //
 // PURPOSE:
-//   The single page of the LearnPulse MVP. It supports two entry modes:
+//   The single page of LearnPulse. Always renders a two-panel layout:
 //
-//   MODE 1 — EXTENSION MODE (automatic):
-//     The Chrome extension opens this page and fires a 'learnpulse:inject'
-//     CustomEvent carrying today's captured searches/URLs as freeform text.
-//     The page responds by:
-//       1. Parsing the text into HistoryEntry[] (client-side, instant)
-//       2. Showing a LEFT PANEL with the parsed entries
-//       3. Letting the user DELETE individual entries they don't want
-//       4. Showing an "Analyze" CTA — user clicks it when satisfied
-//     This gives the user control over which entries go into the AI pipeline
-//     before spending API credits.
+//   ┌──────────── LEFT PANEL (w-72, sticky) ─────────────────────────────┐
+//   │  Captured Entries                                                   │
+//   │  ─────────────────────────────────────────────────────────         │
+//   │  Today's searches and URL visits from the Chrome extension.        │
+//   │  The user can delete individual entries before analyzing.          │
+//   │                                                                    │
+//   │  Empty state: shows a manual paste textarea as a fallback.        │
+//   └─────────────────────────────────────────────────────────────────── ┘
+//   ┌──────────── RIGHT PANEL (flex-1) ──────────────────────────────────┐
+//   │  IDLE:     Post instructions textarea                              │
+//   │  RUNNING:  PipelineStatus progress bar                             │
+//   │  DONE:     ClusterGrid + PostPreview                               │
+//   └─────────────────────────────────────────────────────────────────── ┘
 //
-//   MODE 2 — MANUAL MODE (paste/upload):
-//     Classic single-column layout where the user pastes or uploads history.
-//     Used for testing or for users without the extension.
+// HOW ENTRIES GET INTO THE LEFT PANEL:
 //
-// LAYOUT:
+//   Path A — Extension popup ("Open LearnPulse"):
+//     Popup calls executeScript(world:'MAIN') which:
+//     1. Writes text to localStorage['learnpulse_entries']
+//     2. Dispatches window CustomEvent 'learnpulse:inject'
+//     This useEffect catches the event and parses entries immediately.
 //
-//   EXTENSION MODE (two-panel):
-//   ┌────────────────┬───────────────────────────────────────────┐
-//   │ CAPTURED       │  PIPELINE STATUS + CLUSTERS + POSTS       │
-//   │ ENTRIES (left) │                                           │
-//   │                │  Shown here after the user clicks         │
-//   │  🔍 query 1 ×  │  "Analyze" in the left panel.            │
-//   │  🔗 url 1    × │                                           │
-//   │  🔍 query 2 ×  │                                           │
-//   │                │                                           │
-//   │  [Analyze N]   │                                           │
-//   └────────────────┴───────────────────────────────────────────┘
+//   Path B — Page load/refresh (background script auto-inject):
+//     background.ts listens for chrome.tabs.onUpdated for localhost:3000.
+//     When detected, it runs executeScript that writes to localStorage
+//     and dispatches the same CustomEvent.
+//     If React hasn't hydrated when the event fires, Path C handles it.
 //
-//   MANUAL MODE (single-column):
-//   ┌──────────────────────────────────────────────────────────┐
-//   │  HistoryInput (textarea + file upload)                   │
-//   │  [Analyze My Learning]  [Reset]                          │
-//   │  PipelineStatus                                          │
-//   │  ClusterGrid                                             │
-//   │  PostPreview                                             │
-//   └──────────────────────────────────────────────────────────┘
+//   Path C — localStorage on mount (refresh fallback):
+//     On every mount this useEffect reads localStorage['learnpulse_entries'].
+//     If data exists and was saved today, it's parsed into entries.
+//     This is the most reliable path — works even if Paths A/B were missed.
 //
-// HOOKS USED:
-//   usePipeline() — manages the AI pipeline state machine
-//   useHistory()  — manages textarea input state
+//   Path D — Manual paste:
+//     If no extension data exists, the left panel shows an empty state
+//     with a textarea where the user can paste history manually.
 //
-// KEY EVENT:
-//   'learnpulse:inject' (CustomEvent) — dispatched by the Chrome extension
-//   via chrome.scripting.executeScript(). Carries { text: string } in detail.
+// KEY CHANGE from previous design:
+//   Previously, two-panel was only shown when isExtensionMode === true,
+//   which required the popup to actively inject data each time. Now the
+//   two-panel is always the layout, and localStorage makes entries persist
+//   across refreshes without any popup interaction.
 // ══════════════════════════════════════════════════════════════════════
 
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
 import { usePipeline } from '@/hooks/usePipeline';
-import { useHistory } from '@/hooks/useHistory';
 import { Button } from '@/components/ui';
-import { HistoryInput } from '@/components/history';
 import { PipelineStatus, ClusterGrid } from '@/components/dashboard';
 import { PostPreview } from '@/components/posts';
 import { parseInput } from '@/lib/parsers';
 import type { HistoryEntry } from '@/lib/types';
 
 /**
- * Main Dashboard Page.
+ * The localStorage key written by the Chrome extension (popup + background).
+ * Must match WEB_APP_LS_KEY in chrome-extension/src/types.ts.
  *
- * 'use client' is required because we use React hooks (useState, useCallback, useEffect)
- * and event handlers (onClick, onChange). This entire page is client-side rendered.
+ * We duplicate this constant here rather than importing from the extension
+ * because the extension and web app are separate build targets — there's no
+ * shared module system between them.
+ */
+const LS_KEY = 'learnpulse_entries';
+
+/**
+ * Main Dashboard Page — always renders two-panel layout.
+ *
+ * 'use client' is required because we use React hooks (useState, useCallback,
+ * useEffect), event handlers, and browser APIs (localStorage, CustomEvent).
  */
 export default function DashboardPage() {
-  // ── Hooks ─────────────────────────────────────────────────────────────────────
+  // ── Core pipeline hook ────────────────────────────────────────────────────
   const { state, runPipeline, reset } = usePipeline();
-  const { rawInput, setRawInput, handleFileUpload, isEmpty, fileError } = useHistory();
 
-  // ── Extension Mode State ──────────────────────────────────────────────────────
+  // ── Left panel state ──────────────────────────────────────────────────────
   //
-  // When the Chrome extension injects history data, we switch to "extension mode":
-  //   - isExtensionMode: true → show the two-panel layout
-  //   - capturedEntries: the parsed HistoryEntry[] from the extension
-  //   - instructions: free-form text the user writes to guide post generation
+  // capturedEntries: the entries shown in the left panel.
+  //   Populated from: localStorage (on mount), CustomEvent (real-time inject),
+  //   or manual paste textarea.
   //
-  // The user can delete individual entries from capturedEntries before
-  // clicking "Analyze" — this lets them curate their learning signal.
-  const [isExtensionMode, setIsExtensionMode] = useState(false);
+  // manualInput: the raw text in the manual paste textarea.
+  //   Shown only when capturedEntries is empty (empty state fallback).
   const [capturedEntries, setCapturedEntries] = useState<HistoryEntry[]>([]);
+  const [manualInput, setManualInput] = useState('');
+
+  // ── Right panel state ─────────────────────────────────────────────────────
+  //
+  // instructions: free-form text the user writes to guide post generation.
+  //   Passed to /api/generate as preferences.customInstructions.
+  //   Optional — if blank, the AI uses its default writing style.
   const [instructions, setInstructions] = useState('');
 
-  // ── Chrome Extension Event Listener ──────────────────────────────────────────
+  // ── Entry injection / localStorage bridge ────────────────────────────────
   //
-  // HOW THE EXTENSION COMMUNICATES WITH THIS PAGE:
-  //   1. User clicks "Open LearnPulse" in the extension popup
-  //   2. Popup uses chrome.scripting.executeScript() to inject a function
-  //      into this tab's context
-  //   3. The injected function:
-  //      a. Stores the data: window.__learnpulseInjectData = { text }
-  //      b. Dispatches:      window.dispatchEvent(new CustomEvent('learnpulse:inject', ...))
-  //   4. This useEffect catches that event (if listener is ready) OR reads
-  //      window.__learnpulseInjectData on mount (if event fired first)
+  // This useEffect handles all three paths for getting entries into the left panel:
+  //   - Path C (localStorage): runs first on mount, instant
+  //   - Path A/B (CustomEvent): registers listener for real-time updates
+  //   - Path B (window variable): checks for race-condition fallback variable
   //
-  // RACE CONDITION FIX:
-  //   Problem: Next.js takes 1-3 seconds to hydrate after the HTML loads.
-  //   The extension may fire the CustomEvent BEFORE React's useEffect has run
-  //   and registered the event listener — causing the event to be missed entirely.
+  // WHY useEffect and not useState initial value?
+  //   localStorage is not available during SSR (Next.js renders on the server
+  //   first). Reading it in useEffect guarantees we're in the browser.
   //
-  //   Fix (store-then-dispatch pattern):
-  //   - Extension stores data in window.__learnpulseInjectData before dispatching
-  //   - On mount, this useEffect checks for that variable first
-  //   - If data is already there (event fired before mount): process it immediately
-  //   - If data isn't there yet (normal case): event listener handles it when it fires
-  //   - Variable is deleted after consumption (avoids stale data on re-mount)
-  //
-  // WHY NO AUTO-ANALYZE?
-  //   Previously, receiving this event auto-started the AI pipeline.
-  //   Now we show the entries for review first — the user decides when
-  //   to analyze and can remove entries (noise, private browsing) before
-  //   spending API credits.
+  // WHY NO DEPENDENCY ARRAY ITEMS?
+  //   All state setters (setCapturedEntries) are stable references from useState.
+  //   The effect only needs to run once on mount — adding deps would cause
+  //   re-registration of the event listener on every render.
   useEffect(() => {
-    // Shared handler — processes the injected text regardless of which
-    // delivery path is used (event listener vs. preloaded variable)
+    // ── Shared text → entries processor ──────────────────────────────────
+    //
+    // Called by all three paths. Parses freeform text into HistoryEntry[],
+    // then populates the left panel.
+    //
+    // Also deletes window.__learnpulseInjectData to signal to the extension's
+    // retry loop (in injectHistoryIntoWebApp) that the data was consumed —
+    // preventing the left panel from being reset if a retry fires after the
+    // user has started deleting entries.
     const processInjectedText = (text: string) => {
       if (!text || typeof text !== 'string') return;
 
-      // Parse the injected freeform text into structured HistoryEntry[].
-      // Lines starting with "http" → { source: 'visit', url: ... }
-      // Everything else            → { source: 'search', query: ... }
+      // Signal to the injected script's retry loop that data has been consumed
+      const win = window as unknown as Record<string, unknown>;
+      delete win['__learnpulseInjectData'];
+
+      // Parse freeform text into HistoryEntry[]:
+      //   Lines starting with "http" → { source: 'visit', url }
+      //   Everything else            → { source: 'search', query }
       const { entries } = parseInput(text);
-
-      // Switch to extension mode and populate the left panel
       setCapturedEntries(entries);
-      setIsExtensionMode(true);
-
-      // Also populate rawInput so the user can see the raw data if they
-      // switch back to manual mode
-      setRawInput(text);
     };
 
-    // ── Path B: check for data that arrived before this useEffect ran ────────
-    // (Handles the race where the extension fired the event before React hydrated)
+    // ── Path C: Read from localStorage on mount (handles refresh) ─────────
+    //
+    // The extension writes to localStorage every time it injects data.
+    // On every page load/refresh, we read it here.
+    //
+    // { text: string, savedAt: number } format.
+    // savedAt is checked against today's date — stale data from yesterday
+    // is ignored (extension resets its storage at midnight anyway).
+    try {
+      const stored = localStorage.getItem(LS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as { text: string; savedAt: number };
+        const isToday = new Date(parsed.savedAt).toDateString() === new Date().toDateString();
+        if (isToday && parsed.text) {
+          processInjectedText(parsed.text);
+        }
+      }
+    } catch {
+      // Ignore JSON parse errors from corrupted/mismatched localStorage data
+    }
+
+    // ── Path B: Check window variable (race condition fallback) ───────────
+    //
+    // If the extension fired executeScript before localStorage was read above
+    // (unlikely but possible on very fast machines), the window variable may
+    // have been set. Process it if still present and not yet consumed.
     const win = window as unknown as Record<string, { text: string } | undefined>;
     const preloaded = win['__learnpulseInjectData'];
     if (preloaded?.text) {
       processInjectedText(preloaded.text);
-      delete win['__learnpulseInjectData']; // consume and clear
     }
 
-    // ── Path A: register the real-time event listener for future injections ──
+    // ── Path A: Register real-time event listener ─────────────────────────
+    //
+    // The extension's injectHistoryIntoWebApp dispatches this CustomEvent.
+    // Listening here catches updates that happen after React has hydrated
+    // (e.g., the user opens the popup while the web app is already open).
     const handleExtensionInject = (e: Event) => {
       const text = (e as CustomEvent<{ text: string }>).detail?.text;
       processInjectedText(text);
@@ -158,29 +184,24 @@ export default function DashboardPage() {
     return () => {
       window.removeEventListener('learnpulse:inject', handleExtensionInject);
     };
-  }, [setRawInput]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Derived State ─────────────────────────────────────────────────────────────
+  // ── Derived state ─────────────────────────────────────────────────────────
 
-  // Is the pipeline currently running? (used to disable buttons during analysis)
+  // Is the pipeline running? Used to disable buttons during analysis.
   const isRunning = ['ingesting', 'classifying', 'clustering', 'generating'].includes(state.stage);
 
-  // Count how many classified entries were flagged as learning (for stats display)
+  // Learning entry count for display in ClusterGrid
   const learningEntryCount = state.classified.filter((e) => e.isLearning).length;
 
-  // ── Handlers — Extension Mode ─────────────────────────────────────────────────
+  // ── Handlers ──────────────────────────────────────────────────────────────
 
   /**
    * Removes a single entry from the left panel by its ID.
    *
-   * This is the key UX for the extension mode: the user can prune
-   * noise entries (e.g., weather searches, YouTube browsing) before
-   * they reach the AI classifier.
-   *
-   * WHY THIS MATTERS:
-   *   - Fewer entries = faster API calls + lower cost
-   *   - Removing noise improves cluster quality (AI has cleaner signal)
-   *   - User feels in control of what gets published as their "learning"
+   * Pure client-side state update — no API call. The user prunes noise
+   * (weather searches, YouTube rabbit holes) before the AI sees the data.
+   * Fewer, cleaner entries → better clusters → better posts.
    */
   const deleteEntry = useCallback((id: string) => {
     setCapturedEntries((prev) => prev.filter((e) => e.id !== id));
@@ -189,23 +210,17 @@ export default function DashboardPage() {
   /**
    * Runs the AI pipeline with the curated capturedEntries list.
    *
-   * HOW IT WORKS:
-   *   1. Convert capturedEntries back to freeform text
-   *      (searches first, then URLs — same format the parser expects)
-   *   2. Pass that text to runPipeline() which re-parses + classifies
+   * Converts entries back to freeform text (the format parseInput expects),
+   * then passes it to runPipeline which runs: ingest → classify → cluster → generate.
    *
-   * WHY RE-FORMAT TO TEXT instead of passing HistoryEntry[] directly?
-   *   usePipeline() accepts a raw string and calls parseInput() internally.
-   *   Keeping that interface unchanged avoids modifying the hook and ensures
-   *   the pipeline always starts from the same entry point.
-   *   The round-trip (HistoryEntry → text → HistoryEntry) is harmless here
-   *   since parseInput is deterministic and runs in < 1ms.
+   * User instructions are passed as preferences.customInstructions — the
+   * post-generator injects them as a high-priority directive in the prompts.
    */
-  const handleAnalyzeExtension = useCallback(async () => {
+  const handleAnalyze = useCallback(async () => {
     if (capturedEntries.length === 0 || isRunning) return;
 
-    // Rebuild freeform text from the curated entries
-    // Searches (primary learning signal) come first, then URLs (depth signal)
+    // Rebuild freeform text from curated entries.
+    // Searches (primary signal) first, then URLs (depth signal).
     const searches = capturedEntries
       .filter((e) => e.source === 'search')
       .map((e) => e.query || e.raw);
@@ -214,9 +229,6 @@ export default function DashboardPage() {
       .map((e) => e.url || e.raw);
     const text = [...searches, ...urls].filter(Boolean).join('\n');
 
-    // Pass user instructions as preferences — the post generator uses these
-    // to steer the tone, emphasis, and focus of the generated posts.
-    // If the user left instructions blank, we pass undefined (no override).
     const preferences = instructions.trim()
       ? { customInstructions: instructions.trim() }
       : undefined;
@@ -225,305 +237,177 @@ export default function DashboardPage() {
   }, [capturedEntries, isRunning, runPipeline, instructions]);
 
   /**
-   * Resets both the pipeline and the extension mode state.
-   * Used when the user wants to start fresh (e.g., re-open from the extension).
+   * Loads entries from the manual paste textarea into the left panel.
+   * Used when the extension is not available or has no captures.
    */
-  const handleResetExtension = useCallback(() => {
+  const handleManualLoad = useCallback(() => {
+    if (!manualInput.trim()) return;
+    const { entries } = parseInput(manualInput);
+    setCapturedEntries(entries);
+    setManualInput('');
+  }, [manualInput]);
+
+  /**
+   * Resets everything: pipeline, entries, instructions, manual input.
+   * Returns the left panel to its initial empty/pre-analyze state.
+   */
+  const handleReset = useCallback(() => {
     reset();
     setCapturedEntries([]);
-    setIsExtensionMode(false);
     setInstructions('');
+    setManualInput('');
   }, [reset]);
 
-  // ── Handlers — Manual Mode ────────────────────────────────────────────────────
-
-  const handleAnalyze = async () => {
-    if (isEmpty || isRunning) return;
-    await runPipeline(rawInput);
-  };
-
-  const handleReset = () => {
-    reset();
-    // Intentionally keep rawInput — the user might want to tweak and re-run
-  };
-
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <div className="max-w-6xl mx-auto px-4 py-8 sm:px-6">
 
-      {isExtensionMode ? (
-        // ── EXTENSION MODE: Two-panel layout ─────────────────────────────────
-        // Left panel: captured entries list (review + delete)
-        // Right panel: pipeline status + clusters + generated posts
-        //
-        // We use max-w-6xl (wider than manual mode) to fit both panels
-        // comfortably side by side.
-        <div className="max-w-6xl mx-auto px-4 py-8 sm:px-6">
+        {/* ── Header ──────────────────────────────────────────────────────── */}
+        <header className="mb-8 text-center">
+          <div className="inline-flex items-center gap-2 mb-2">
+            <span className="text-3xl">🧠</span>
+            <h1 className="text-3xl font-bold text-gray-900 tracking-tight">
+              LearnPulse
+            </h1>
+          </div>
+          <p className="text-sm text-gray-500">
+            Review your captures, remove anything irrelevant, then analyze.
+          </p>
+        </header>
 
-          {/* Header (shared across both modes) */}
-          <header className="mb-8 text-center">
-            <div className="inline-flex items-center gap-2 mb-2">
-              <span className="text-3xl">🧠</span>
-              <h1 className="text-3xl font-bold text-gray-900 tracking-tight">
-                LearnPulse
-              </h1>
-            </div>
-            <p className="text-sm text-gray-500">
-              Review your captures, remove anything irrelevant, then analyze.
-            </p>
-          </header>
+        {/* ── Two-panel body (always rendered) ────────────────────────────── */}
+        <div className="flex gap-6 items-start">
 
-          {/* Two-panel body */}
-          <div className="flex gap-6 items-start">
+          {/* ── LEFT PANEL: Captured Entries ─────────────────────────────── */}
+          {/*
+            w-72: fixed width so the right panel gets the majority of space.
+            flex-shrink-0: prevents the left panel from collapsing when the
+            right panel content grows.
+            sticky top-4: keeps the panel visible while scrolling results.
+          */}
+          <div className="w-72 flex-shrink-0">
+            <CapturedEntriesPanel
+              entries={capturedEntries}
+              manualInput={manualInput}
+              onManualInputChange={setManualInput}
+              onManualLoad={handleManualLoad}
+              onDelete={deleteEntry}
+              onAnalyze={handleAnalyze}
+              onReset={handleReset}
+              isRunning={isRunning}
+              pipelineComplete={state.stage === 'complete'}
+            />
+          </div>
 
-            {/* ── LEFT PANEL: Captured Entries ─────────────────────────────── */}
+          {/* ── RIGHT PANEL: Instructions + Pipeline Output ───────────────── */}
+          {/*
+            flex-1: takes all remaining horizontal space.
+            min-w-0: prevents flex overflow when content is wide (e.g., long posts).
+
+            Content progression:
+              stage === 'idle'     → instructions textarea + hint
+              stage !== 'idle'     → PipelineStatus (progress)
+              clusters available   → ClusterGrid
+              stage === 'complete' → PostPreview
+          */}
+          <div className="flex-1 min-w-0">
+
+            {/* Instructions panel — shown only while idle */}
             {/*
-              This panel is the heart of the extension mode UX.
-              The user sees their raw captures and can delete entries before
-              the AI pipeline touches them.
-              'sticky top-4' keeps it visible while scrolling the right panel.
+              The instructions textarea lets the user steer the AI before
+              clicking Analyze. If left blank, the AI uses its default style.
+              These instructions become a PRIORITY directive in the generation
+              prompt — the model treats them as a hard constraint, not a hint.
             */}
-            <div className="w-72 flex-shrink-0">
-              <CapturedEntriesPanel
-                entries={capturedEntries}
-                onDelete={deleteEntry}
-                onAnalyze={handleAnalyzeExtension}
-                onReset={handleResetExtension}
-                isRunning={isRunning}
-                pipelineComplete={state.stage === 'complete'}
-              />
-            </div>
-
-            {/* ── RIGHT PANEL: Analysis Results ────────────────────────────── */}
-            {/*
-              Starts empty ("waiting for analysis" placeholder).
-              Fills in progressively as the pipeline stages complete:
-                - PipelineStatus: visible from 'ingesting' through 'complete'
-                - ClusterGrid:    visible once clustering finishes
-                - PostPreview:    visible only when stage === 'complete'
-            */}
-            <div className="flex-1 min-w-0">
-
-              {/* Idle state: instructions input + prompt to click Analyze */}
-              {/*
-                This panel has two jobs when idle:
-                1. Let the user write free-form instructions for the AI
-                2. Show a hint pointing them to the Analyze button
-
-                The instructions are optional — if left blank, the AI uses
-                its default writing style. If filled in, the instructions
-                become a high-priority directive in the generation prompt.
-              */}
-              {state.stage === 'idle' && (
-                <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
-                  {/* Section label */}
-                  <div className="mb-3">
-                    <h3 className="text-sm font-semibold text-gray-700">
-                      Post instructions
-                      <span className="ml-2 text-xs font-normal text-gray-400">optional</span>
-                    </h3>
-                    <p className="text-xs text-gray-400 mt-0.5">
-                      Tell the AI how to write your post — topic focus, audience, tone, or specific things to include.
-                    </p>
-                  </div>
-
-                  {/*
-                    Instructions textarea.
-                    - resize-none prevents the user from resizing it (keeps layout stable)
-                    - Tailwind focus ring matches the app's indigo brand color
-                    - rows={5} gives enough room for a sentence or two
-                  */}
-                  <textarea
-                    value={instructions}
-                    onChange={(e) => setInstructions(e.target.value)}
-                    placeholder={
-                      'Examples:\n' +
-                      '• "Focus on the debugging journey, not the solution"\n' +
-                      '• "Write for a React developer audience"\n' +
-                      '• "Emphasize the production impact and what I learned about async I/O"'
-                    }
-                    rows={5}
-                    className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm text-gray-700 placeholder-gray-300 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-shadow"
-                  />
-
-                  {/* Hint pointing to the Analyze button */}
-                  <p className="text-xs text-gray-300 mt-2 text-center">
-                    When ready, click <span className="font-medium text-gray-400">Analyze</span> in the left panel
+            {state.stage === 'idle' && (
+              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+                <div className="mb-3">
+                  <h3 className="text-sm font-semibold text-gray-700">
+                    Post instructions
+                    <span className="ml-2 text-xs font-normal text-gray-400">optional</span>
+                  </h3>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Tell the AI how to write your post — topic focus, audience, tone, or specific things to include.
                   </p>
                 </div>
-              )}
 
-              {/* Pipeline progress indicator */}
-              {state.stage !== 'idle' && (
-                <div className="mb-6">
-                  <PipelineStatus
-                    stage={state.stage}
-                    error={state.error}
-                    entryCount={state.entries.length}
-                    learningCount={learningEntryCount}
-                  />
-                </div>
-              )}
+                {/*
+                  resize-none: prevents user resizing (keeps layout stable).
+                  rows={5}: enough space for a sentence or two.
+                  focus ring uses indigo to match the brand accent color.
+                */}
+                <textarea
+                  value={instructions}
+                  onChange={(e) => setInstructions(e.target.value)}
+                  placeholder={
+                    'Examples:\n' +
+                    '• "Focus on the debugging journey, not the solution"\n' +
+                    '• "Write for a React developer audience"\n' +
+                    '• "Emphasize the production impact and what I learned about async I/O"'
+                  }
+                  rows={5}
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm text-gray-700 placeholder-gray-300 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-shadow"
+                />
 
-              {/* Learning clusters (appear after clustering stage) */}
-              {state.clusters.length > 0 && (
-                <div className="mb-6">
-                  <ClusterGrid
-                    clusters={state.clusters}
-                    learningEntryCount={learningEntryCount}
-                  />
-                </div>
-              )}
+                <p className="text-xs text-gray-300 mt-2 text-center">
+                  When ready, click <span className="font-medium text-gray-400">Analyze</span> in the left panel
+                </p>
+              </div>
+            )}
 
-              {/* Generated posts (appear only when pipeline is fully complete) */}
-              {state.stage === 'complete' && state.posts && (
-                <div className="mb-6">
-                  <PostPreview posts={state.posts} />
-                </div>
-              )}
-            </div>
+            {/* Pipeline progress — shown from 'ingesting' through 'complete' */}
+            {state.stage !== 'idle' && (
+              <div className="mb-6">
+                <PipelineStatus
+                  stage={state.stage}
+                  error={state.error}
+                  entryCount={state.entries.length}
+                  learningCount={learningEntryCount}
+                />
+              </div>
+            )}
+
+            {/* Learning clusters — appear after the clustering stage */}
+            {state.clusters.length > 0 && (
+              <div className="mb-6">
+                <ClusterGrid
+                  clusters={state.clusters}
+                  learningEntryCount={learningEntryCount}
+                />
+              </div>
+            )}
+
+            {/* Generated posts — appear only when pipeline is fully complete */}
+            {state.stage === 'complete' && state.posts && (
+              <div className="mb-6">
+                <PostPreview posts={state.posts} />
+              </div>
+            )}
           </div>
         </div>
-
-      ) : (
-        // ── MANUAL MODE: Original single-column layout ────────────────────────
-        // Used for paste/upload input (no extension, or extension had no entries).
-        <div className="max-w-4xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
-
-          {/* Header */}
-          <header className="mb-10 text-center">
-            <div className="inline-flex items-center gap-2 mb-3">
-              <span className="text-3xl">🧠</span>
-              <h1 className="text-3xl font-bold text-gray-900 tracking-tight">
-                LearnPulse
-              </h1>
-            </div>
-            <p className="text-base text-gray-500 max-w-xl mx-auto">
-              Paste your daily search history. Get reflective{' '}
-              <span className="text-indigo-600 font-medium">LinkedIn</span> and{' '}
-              <span className="font-medium">𝕏</span> posts about what you actually learned.
-            </p>
-
-            {/* How it works — compact inline step indicators */}
-            <div className="flex items-center justify-center gap-2 mt-4 text-xs text-gray-400 flex-wrap">
-              <Step label="Paste history" />
-              <Arrow />
-              <Step label="AI classifies intent" />
-              <Arrow />
-              <Step label="Groups into journeys" />
-              <Arrow />
-              <Step label="Generates posts" />
-            </div>
-          </header>
-
-          {/* Input Section */}
-          <section className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-            <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-3">
-              Your History
-            </h2>
-
-            <HistoryInput
-              rawInput={rawInput}
-              onChange={setRawInput}
-              onFileUpload={handleFileUpload}
-              charCount={rawInput.length}
-              fileError={fileError}
-            />
-
-            {/* Action buttons */}
-            <div className="flex items-center gap-3 mt-4 flex-wrap">
-              <Button
-                onClick={handleAnalyze}
-                isLoading={isRunning}
-                disabled={isEmpty || isRunning}
-                size="lg"
-                className="flex-shrink-0"
-              >
-                {isRunning ? 'Analyzing...' : 'Analyze My Learning'}
-              </Button>
-
-              {/* Reset button — only shown when there's something to reset */}
-              {(state.stage !== 'idle' || !isEmpty) && (
-                <Button
-                  variant="secondary"
-                  size="lg"
-                  onClick={handleReset}
-                  disabled={isRunning}
-                >
-                  Start over
-                </Button>
-              )}
-
-              {/* Entry count hint — shown after parsing */}
-              {state.entries.length > 0 && !isRunning && (
-                <span className="text-sm text-gray-500">
-                  {state.entries.length} entries parsed
-                  {learningEntryCount > 0 && ` · ${learningEntryCount} learning signals`}
-                </span>
-              )}
-            </div>
-          </section>
-
-          {/* Pipeline Status */}
-          {state.stage !== 'idle' && (
-            <div className="mb-6">
-              <PipelineStatus
-                stage={state.stage}
-                error={state.error}
-                entryCount={state.entries.length}
-                learningCount={learningEntryCount}
-              />
-            </div>
-          )}
-
-          {/* Learning Clusters */}
-          {state.clusters.length > 0 && (
-            <div className="mb-6">
-              <ClusterGrid
-                clusters={state.clusters}
-                learningEntryCount={learningEntryCount}
-              />
-            </div>
-          )}
-
-          {/* Generated Posts */}
-          {state.stage === 'complete' && state.posts && (
-            <div className="mb-6">
-              <PostPreview posts={state.posts} />
-            </div>
-          )}
-
-          {/* Footer */}
-          <footer className="text-center text-xs text-gray-400 mt-10 pb-4">
-            <p>Your history is processed in memory and never stored.</p>
-            <p className="mt-1">LearnPulse MVP · Powered by DeepSeek AI</p>
-          </footer>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
 
 // ─── Left Panel Component ─────────────────────────────────────────────────────
 //
-// This component renders the left panel in extension mode.
-// It's defined here (same file) because it's only used on this page and
-// is tightly coupled to the extension-mode state logic above.
+// Renders the sticky left panel with the entry list (or empty state).
+// Defined in the same file because it's tightly coupled to this page's state.
 //
-// WHAT IT SHOWS:
-//   - Header: entry count + search/URL breakdown
-//   - Scrollable list: each entry with icon + text + delete button (×)
-//   - Footer: "Analyze N entries" primary button + "Start over" link
-//
-// INTERACTION MODEL:
-//   - Hover over an entry → reveals the × button
-//   - Click × → removes that entry from capturedEntries (client-side, instant)
-//   - Click "Analyze N entries" → triggers the AI pipeline with remaining entries
-//   - Click "Start over" → clears everything and returns to manual mode
+// STATES:
+//   Has entries → shows entry list with delete buttons + Analyze button
+//   No entries  → shows empty state with:
+//     - Hint to use the extension
+//     - Manual paste textarea (fallback for users without the extension)
 
 interface CapturedEntriesPanelProps {
   entries: HistoryEntry[];
+  manualInput: string;
+  onManualInputChange: (value: string) => void;
+  onManualLoad: () => void;
   onDelete: (id: string) => void;
   onAnalyze: () => void;
   onReset: () => void;
@@ -533,6 +417,9 @@ interface CapturedEntriesPanelProps {
 
 function CapturedEntriesPanel({
   entries,
+  manualInput,
+  onManualInputChange,
+  onManualLoad,
   onDelete,
   onAnalyze,
   onReset,
@@ -541,6 +428,7 @@ function CapturedEntriesPanel({
 }: CapturedEntriesPanelProps) {
   const searchCount = entries.filter((e) => e.source === 'search').length;
   const urlCount = entries.filter((e) => e.source === 'visit').length;
+  const hasEntries = entries.length > 0;
 
   return (
     <div className="bg-white rounded-xl border border-gray-200 shadow-sm sticky top-4">
@@ -549,122 +437,129 @@ function CapturedEntriesPanel({
       <div className="px-4 py-3 border-b border-gray-100">
         <div className="flex items-center justify-between mb-1">
           <h2 className="text-sm font-semibold text-gray-700">Captured Today</h2>
-          <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">
-            {entries.length}
-          </span>
+          {hasEntries && (
+            <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">
+              {entries.length}
+            </span>
+          )}
         </div>
-        {/* Stat breakdown */}
-        <p className="text-xs text-gray-400">
-          {searchCount} {searchCount === 1 ? 'search' : 'searches'} · {urlCount} {urlCount === 1 ? 'URL' : 'URLs'}
-        </p>
-      </div>
-
-      {/* ── Entry List ───────────────────────────────────────────────────── */}
-      {/*
-        max-h limits height so the panel doesn't overflow the viewport.
-        overflow-y-auto adds a scrollbar when needed.
-        Each entry row uses 'group' to show the × button only on hover —
-        this keeps the list readable while still making delete accessible.
-      */}
-      <div className="max-h-[calc(100vh-300px)] overflow-y-auto divide-y divide-gray-50">
-        {entries.length === 0 ? (
-          // Empty state: user deleted everything
-          <div className="px-4 py-8 text-center">
-            <p className="text-sm text-gray-400">All entries removed</p>
-            <p className="text-xs text-gray-300 mt-1">Nothing left to analyze</p>
-          </div>
-        ) : (
-          entries.map((entry) => {
-            // Choose icon and display text based on entry type
-            const icon = entry.source === 'search' ? '🔍' : '🔗';
-            // For URL visits, prefer the page title if available (more readable).
-            // Fall back to the URL itself, then the raw string.
-            const displayText = entry.title || entry.query || entry.url || entry.raw;
-
-            return (
-              <div
-                key={entry.id}
-                className="flex items-start gap-2 px-4 py-2.5 hover:bg-gray-50 group"
-              >
-                {/* Entry type icon */}
-                <span className="text-xs mt-0.5 flex-shrink-0 select-none">
-                  {icon}
-                </span>
-
-                {/* Entry text — truncated with ellipsis, full text on hover (title attr) */}
-                <span
-                  className="flex-1 text-xs text-gray-600 leading-relaxed min-w-0 truncate"
-                  title={entry.query || entry.url || entry.raw}
-                >
-                  {displayText}
-                </span>
-
-                {/* Delete button — hidden by default, shown on row hover */}
-                {/*
-                  opacity-0 group-hover:opacity-100 creates the reveal effect.
-                  aria-label makes it accessible for screen readers.
-                */}
-                <button
-                  onClick={() => onDelete(entry.id)}
-                  className="flex-shrink-0 w-4 h-4 flex items-center justify-center text-gray-300 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity rounded"
-                  aria-label={`Remove: ${displayText}`}
-                  title="Remove this entry"
-                >
-                  ×
-                </button>
-              </div>
-            );
-          })
+        {hasEntries && (
+          <p className="text-xs text-gray-400">
+            {searchCount} {searchCount === 1 ? 'search' : 'searches'} · {urlCount} {urlCount === 1 ? 'URL' : 'URLs'}
+          </p>
         )}
       </div>
 
-      {/* ── Panel Footer ─────────────────────────────────────────────────── */}
-      {/*
-        Primary: "Analyze N entries" button — triggers the AI pipeline.
-        Disabled when: no entries left, pipeline is running, or pipeline is complete.
+      {/* ── Entry List or Empty State ─────────────────────────────────────── */}
+      <div className="max-h-[calc(100vh-280px)] overflow-y-auto">
+        {hasEntries ? (
+          // Entry list: each row shows icon + text + hover-to-reveal × button
+          <div className="divide-y divide-gray-50">
+            {entries.map((entry) => {
+              const icon = entry.source === 'search' ? '🔍' : '🔗';
+              // Prefer page title (more readable), fall back to query/URL/raw
+              const displayText = entry.title || entry.query || entry.url || entry.raw;
 
-        Secondary: "Start over" link — clears everything and returns to manual mode.
-        Useful if the user wants to paste different history instead.
-      */}
-      <div className="p-3 border-t border-gray-100 flex flex-col gap-2">
-        <Button
-          onClick={onAnalyze}
-          isLoading={isRunning}
-          disabled={entries.length === 0 || isRunning || pipelineComplete}
-          size="md"
-          className="w-full"
-        >
-          {isRunning
-            ? 'Analyzing...'
-            : pipelineComplete
-              ? 'Analysis complete'
-              : `Analyze ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
-        </Button>
+              return (
+                <div
+                  key={entry.id}
+                  className="flex items-start gap-2 px-4 py-2.5 hover:bg-gray-50 group"
+                >
+                  <span className="text-xs mt-0.5 flex-shrink-0 select-none">
+                    {icon}
+                  </span>
 
-        <button
-          onClick={onReset}
-          disabled={isRunning}
-          className="text-xs text-gray-400 hover:text-gray-600 transition-colors text-center py-0.5 disabled:opacity-50"
-        >
-          Start over
-        </button>
+                  {/*
+                    truncate + title: shows truncated text in the row,
+                    full text in a native tooltip on hover.
+                  */}
+                  <span
+                    className="flex-1 text-xs text-gray-600 leading-relaxed min-w-0 truncate"
+                    title={entry.query || entry.url || entry.raw}
+                  >
+                    {displayText}
+                  </span>
+
+                  {/*
+                    Delete button: hidden by default (opacity-0), revealed on
+                    row hover via group-hover:opacity-100 transition.
+                  */}
+                  <button
+                    onClick={() => onDelete(entry.id)}
+                    className="flex-shrink-0 w-4 h-4 flex items-center justify-center text-gray-300 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity rounded"
+                    aria-label={`Remove: ${displayText}`}
+                    title="Remove this entry"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          // Empty state: extension not installed or no captures today.
+          // Shows a minimal manual paste fallback so the user can still use the app.
+          <div className="px-4 py-4">
+            <p className="text-xs text-gray-400 mb-1 font-medium">No captures yet</p>
+            <p className="text-xs text-gray-300 mb-4 leading-relaxed">
+              Open the extension popup and click <span className="text-gray-400">Open LearnPulse</span> to load today&apos;s captures automatically.
+            </p>
+
+            {/* Manual paste fallback */}
+            <div className="border-t border-gray-100 pt-3">
+              <p className="text-xs text-gray-400 mb-2">Or paste manually:</p>
+              <textarea
+                value={manualInput}
+                onChange={(e) => onManualInputChange(e.target.value)}
+                placeholder={"how does TCP work\nhttps://stackoverflow.com/...\npython async await"}
+                rows={5}
+                className="w-full border border-gray-200 rounded-lg px-2.5 py-2 text-xs text-gray-600 placeholder-gray-300 resize-none focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-transparent"
+              />
+              {manualInput.trim() && (
+                <Button
+                  size="sm"
+                  onClick={onManualLoad}
+                  className="w-full mt-2"
+                >
+                  Load entries
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* ── Panel Footer: Analyze + Reset ────────────────────────────────── */}
+      {/*
+        Only shown when there are entries to analyze.
+        "Analyze N entries" is disabled while running or after completion.
+        "Start over" clears everything and returns to the empty state.
+      */}
+      {hasEntries && (
+        <div className="p-3 border-t border-gray-100 flex flex-col gap-2">
+          <Button
+            onClick={onAnalyze}
+            isLoading={isRunning}
+            disabled={isRunning || pipelineComplete}
+            size="md"
+            className="w-full"
+          >
+            {isRunning
+              ? 'Analyzing...'
+              : pipelineComplete
+                ? 'Analysis complete'
+                : `Analyze ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
+          </Button>
+
+          <button
+            onClick={onReset}
+            disabled={isRunning}
+            className="text-xs text-gray-400 hover:text-gray-600 transition-colors text-center py-0.5 disabled:opacity-50"
+          >
+            Start over
+          </button>
+        </div>
+      )}
     </div>
   );
-}
-
-// ─── Small Helper Components ──────────────────────────────────────────────────
-// Tiny presentational components for the manual-mode header "how it works" steps.
-// Too small to warrant their own files.
-
-function Step({ label }: { label: string }) {
-  return (
-    <span className="px-2 py-1 bg-white border border-gray-200 rounded-full text-gray-500">
-      {label}
-    </span>
-  );
-}
-
-function Arrow() {
-  return <span className="text-gray-300">→</span>;
 }
