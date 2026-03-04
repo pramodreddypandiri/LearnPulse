@@ -38,27 +38,14 @@
       return;
     }
     try {
-      const script = document.createElement("script");
-      script.textContent = `
-      (function() {
-        try {
-          var stored = localStorage.getItem(${JSON.stringify(lsKey)});
-          if (!stored) return;
-          var data = JSON.parse(stored);
-          if (!data || !data.text) return;
-          window.dispatchEvent(new CustomEvent('learnpulse:inject', {
-            detail: { text: data.text }
-          }));
-          console.log('[LearnPulse] Content script (main world): dispatched learnpulse:inject');
-        } catch(e) {
-          console.warn('[LearnPulse] Content script (main world): event dispatch failed', e);
-        }
-      })();
-    `;
-      document.head.appendChild(script);
-      script.remove();
+      window.postMessage(
+        { type: "learnpulse:inject", text },
+        window.location.origin
+        // only the same-origin page receives this
+      );
+      console.log("[LearnPulse] Content script: sent postMessage to page");
     } catch (e) {
-      console.warn("[LearnPulse] Content script: could not dispatch CustomEvent:", e);
+      console.warn("[LearnPulse] Content script: postMessage failed:", e);
     }
   })();
 })();

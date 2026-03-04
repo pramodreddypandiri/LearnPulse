@@ -26,15 +26,14 @@
 //     4. Content scripts share localStorage with the host page (same origin)
 //
 // TWO-STEP APPROACH:
-//   Step 1: Write to localStorage (shared with the page) — this is the
-//           reliable bridge. page.tsx reads it in useEffect on every mount.
+//   Step 1: Write to localStorage (shared with the page) — the primary bridge.
+//           page.tsx reads it in useEffect on every mount. Works even if
+//           Step 2 is blocked or races with React hydration.
 //
-//   Step 2: Dispatch CustomEvent in the MAIN world — this handles the case
-//           where React has already hydrated and is waiting for new data.
-//           Since content scripts run in ISOLATED world, we inject a small
-//           inline <script> that runs in MAIN world and dispatches the event.
-//           The inline script reads from localStorage (already written in Step 1)
-//           rather than embedding the text content — safe and XSS-free.
+//   Step 2: Send a window.postMessage() to the page — for real-time updates
+//           when React is already hydrated. postMessage() crosses the
+//           isolated/MAIN world boundary safely. Previously this used an
+//           inline <script> tag, but that was blocked by Next.js's CSP.
 //
 // HOW IT FITS IN THE OVERALL INJECTION CHAIN:
 //
@@ -102,54 +101,36 @@ import { readStorage, formatEntriesAsText, WEB_APP_LS_KEY } from './types';
     return; // If localStorage write fails, the dispatch won't help either
   }
 
-  // ── Step 2: Dispatch CustomEvent in the MAIN world ────────────────────────
+  // ── Step 2: Notify the page via window.postMessage ───────────────────────
   //
   // Content scripts run in Chrome's ISOLATED world — a separate JavaScript
   // context from the page's MAIN world. This means:
-  //   - window in isolated world ≠ window in main world
-  //   - window.dispatchEvent() in isolated world only reaches isolated listeners
-  //   - React's event listeners (registered via useEffect) are in MAIN world
+  //   - window.dispatchEvent() in isolated world reaches only isolated listeners
+  //   - React's useEffect listeners are in MAIN world and can't see those events
   //
-  // To dispatch an event that React can catch, we inject a tiny <script> tag.
-  // Script tags always run in the MAIN world.
+  // PREVIOUS APPROACH (broken): injecting an inline <script> tag.
+  //   This was blocked by Next.js's Content Security Policy (CSP), which
+  //   disallows 'unsafe-inline' scripts. CSP error in the browser console:
+  //   "Executing inline script violates the following Content Security Policy directive..."
   //
-  // The inline script reads from localStorage (just written in Step 1) rather
-  // than embedding the raw text content. This avoids any XSS risk — the script
-  // source only contains the key name, not user data.
+  // CURRENT APPROACH: window.postMessage()
+  //   Even though content scripts are isolated, window.postMessage() crosses
+  //   the world boundary — messages are dispatched to the page's MAIN world
+  //   and received via window.addEventListener('message', ...) in React.
+  //   This works without any CSP exceptions because postMessage is a standard
+  //   browser communication channel, not inline script execution.
+  //
+  // page.tsx listens for messages with type 'learnpulse:inject' in its useEffect.
+  // It validates the origin (same as current page) before processing.
   try {
-    const script = document.createElement('script');
-
-    // The injected script:
-    //   1. Reads text from localStorage (same data we just wrote)
-    //   2. Dispatches 'learnpulse:inject' event that React is listening for
-    //
-    // JSON.stringify(lsKey) safely encodes the key name as a string literal.
-    // No user data (URLs, queries) is embedded in the script source.
-    script.textContent = `
-      (function() {
-        try {
-          var stored = localStorage.getItem(${JSON.stringify(lsKey)});
-          if (!stored) return;
-          var data = JSON.parse(stored);
-          if (!data || !data.text) return;
-          window.dispatchEvent(new CustomEvent('learnpulse:inject', {
-            detail: { text: data.text }
-          }));
-          console.log('[LearnPulse] Content script (main world): dispatched learnpulse:inject');
-        } catch(e) {
-          console.warn('[LearnPulse] Content script (main world): event dispatch failed', e);
-        }
-      })();
-    `;
-
-    // Injecting into <head> runs the script immediately.
-    // We remove it after execution to keep the DOM clean.
-    document.head.appendChild(script);
-    script.remove();
-
+    window.postMessage(
+      { type: 'learnpulse:inject', text },
+      window.location.origin // only the same-origin page receives this
+    );
+    console.log('[LearnPulse] Content script: sent postMessage to page');
   } catch (e) {
-    // If the CustomEvent dispatch fails, that's OK — localStorage is the
-    // reliable bridge. The useEffect in page.tsx will read it on mount.
-    console.warn('[LearnPulse] Content script: could not dispatch CustomEvent:', e);
+    // If postMessage fails, that's OK — localStorage is the reliable bridge.
+    // The useEffect in page.tsx reads it on mount (before React finishes hydrating).
+    console.warn('[LearnPulse] Content script: postMessage failed:', e);
   }
 })();
