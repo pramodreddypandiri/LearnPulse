@@ -59,7 +59,7 @@
 //   - Access page globals directly (content scripts are in isolated world)
 // ══════════════════════════════════════════════════════════════════════
 
-import { readStorage, formatEntriesAsText, WEB_APP_LS_KEY } from './types';
+import { readStorage, formatEntriesAsText, WEB_APP_LS_KEY, STORAGE_KEY, getTodayString } from './types';
 
 (async () => {
   // ── Read today's captured entries from chrome.storage.local ──────────────
@@ -134,3 +134,52 @@ import { readStorage, formatEntriesAsText, WEB_APP_LS_KEY } from './types';
     console.warn('[LearnPulse] Content script: postMessage failed:', e);
   }
 })();
+
+// ─── Clear History Listener ───────────────────────────────────────────────────
+//
+// PURPOSE:
+//   Listens for 'learnpulse:clear' messages sent from page.tsx when the
+//   user clicks "Clear History". When received, empties chrome.storage.local
+//   entries for today so that a page refresh does NOT re-populate the left panel.
+//
+// WHY THIS IS NEEDED:
+//   page.tsx can only clear the web app's own localStorage (the bridge key).
+//   But chrome.storage.local is owned by the extension — the web page cannot
+//   access it directly (different origin / different API).
+//   Content scripts CAN access chrome.storage, so we relay the clear request
+//   through a postMessage from the page to this content script.
+//
+// SIDE EFFECT — BADGE RESET:
+//   After we write an empty entries array to chrome.storage.local, the
+//   background service worker's chrome.storage.onChanged listener fires
+//   automatically and calls updateBadge(). Since count === 0, updateBadge()
+//   clears the badge text → the extension icon shows no number.
+//
+// SECURITY:
+//   We check e.origin === window.location.origin to ensure the message
+//   comes from the LearnPulse page itself, not from any other origin.
+window.addEventListener('message', async (e: MessageEvent<{ type?: string }>) => {
+  // Guard 1: only accept messages from the same origin (localhost:3000)
+  if (e.origin !== window.location.origin) return;
+
+  // Guard 2: only handle the clear command
+  if (e.data?.type !== 'learnpulse:clear') return;
+
+  try {
+    // Write an empty entries array while keeping today's date intact.
+    // Keeping the date field means readStorage() won't mistake this for
+    // a stale previous-day record — it will correctly return { entries: [] }.
+    const clearedStorage = { date: getTodayString(), entries: [] };
+    await chrome.storage.local.set({ [STORAGE_KEY]: clearedStorage });
+
+    // Also clear the localStorage bridge key so the next page load doesn't
+    // find any stale text written by a previous inject cycle.
+    try {
+      localStorage.removeItem(WEB_APP_LS_KEY);
+    } catch { /* ignore — belt-and-suspenders, localStorage already cleared by page.tsx */ }
+
+    console.log('[LearnPulse] Content script: cleared chrome.storage entries on user request');
+  } catch (err) {
+    console.error('[LearnPulse] Content script: failed to clear chrome.storage:', err);
+  }
+});

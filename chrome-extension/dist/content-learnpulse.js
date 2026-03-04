@@ -48,5 +48,20 @@
       console.warn("[LearnPulse] Content script: postMessage failed:", e);
     }
   })();
+  window.addEventListener("message", async (e) => {
+    if (e.origin !== window.location.origin) return;
+    if (e.data?.type !== "learnpulse:clear") return;
+    try {
+      const clearedStorage = { date: getTodayString(), entries: [] };
+      await chrome.storage.local.set({ [STORAGE_KEY]: clearedStorage });
+      try {
+        localStorage.removeItem(WEB_APP_LS_KEY);
+      } catch {
+      }
+      console.log("[LearnPulse] Content script: cleared chrome.storage entries on user request");
+    } catch (err) {
+      console.error("[LearnPulse] Content script: failed to clear chrome.storage:", err);
+    }
+  });
 })();
 //# sourceMappingURL=content-learnpulse.js.map
