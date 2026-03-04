@@ -48,6 +48,90 @@ import type { HistoryEntry, ClassifiedEntry, LearningIntent, ContentType } from 
 /** Maximum entries per DeepSeek API call — stays within context limits */
 const BATCH_SIZE = 50;
 
+// ─── Pre-filter: Deterministic Noise Detection ──────────────────────────────
+//
+// WHY PRE-FILTER BEFORE AI?
+//   Sending every URL to DeepSeek is expensive (tokens) and slow (latency).
+//   Many URLs are unambiguously noise — social media feeds, email, job boards,
+//   entertainment streaming — and don't need AI to classify them.
+//
+//   Pre-filtering:
+//   ✅ Faster — no API round-trip for filtered entries
+//   ✅ Cheaper — saves tokens proportional to the number of filtered entries
+//   ✅ More reliable — rule-based, never misclassifies gmail as "learning"
+//
+// TWO-TIER MATCHING:
+//   Tier 1 — Full URL substring match: for highly specific domain names
+//     (e.g., 'linkedin.com', 'netflix.com') that are specific enough that
+//     a false positive (an educational article hosted at these domains) is
+//     virtually impossible.
+//
+//   Tier 2 — Hostname-only match: for generic words like 'job', 'careers'
+//     that could appear in legitimate URLs:
+//       ✗ "cron job tutorial" → article on github.io, full URL contains "job"
+//       ✗ "kubernetes job spec" → docs page, full URL contains "job"
+//       ✓ jobs.greenhouse.io   → hostname = 'jobs.greenhouse.io' → filtered
+//       ✓ careers.google.com   → hostname = 'careers.google.com' → filtered
+//
+// ONLY APPLIES TO 'visit' (URL) ENTRIES:
+//   Search queries are ambiguous — "linkedin api oauth" or "Steve Jobs biography"
+//   contain noise keywords but are valid learning searches.
+//   We let the AI handle all search queries unchanged.
+
+/**
+ * Full URL substrings that definitively identify noise pages.
+ * These are specific enough that false positives are extremely unlikely.
+ */
+const NOISE_URL_SUBSTRINGS = [
+  'gmail',          // Gmail (email client)
+  'instagram',      // Instagram social feed
+  'x.com',          // X / Twitter social feed
+  'linkedin.com',   // LinkedIn feed and messaging
+  'netflix.com',    // Entertainment streaming
+  'indeed',         // Indeed job search (indeed.com, indeed.co.uk, etc.)
+  'dice.com',       // Tech job board
+  'workday',        // HR/payroll SaaS (workday.com, *.workday.com)
+];
+
+/**
+ * Keywords matched against the hostname ONLY.
+ * Prevents false positives on articles that mention these words in their URL path.
+ */
+const NOISE_HOSTNAME_KEYWORDS = [
+  'job',      // job.company.com
+  'jobs',     // jobs.company.com, boards.greenhouse.io → also jobs in hostname
+  'careers',  // careers.company.com
+];
+
+/**
+ * Returns true if a HistoryEntry is definitively noise and can skip AI classification.
+ *
+ * Two-tier check:
+ *   1. Full URL contains one of the NOISE_URL_SUBSTRINGS (specific domains)
+ *   2. URL hostname contains one of the NOISE_HOSTNAME_KEYWORDS (generic words)
+ *
+ * Only applies to 'visit' entries — search queries go to AI regardless.
+ */
+function isDefinitelyNoise(entry: HistoryEntry): boolean {
+  // Search queries are handled by the AI — too ambiguous for rule-based filtering
+  if (entry.source !== 'visit' || !entry.url) return false;
+
+  const url = entry.url.toLowerCase();
+
+  // Tier 1: specific domain substring match
+  if (NOISE_URL_SUBSTRINGS.some((pattern) => url.includes(pattern))) return true;
+
+  // Tier 2: hostname-only match for generic job/career keywords
+  try {
+    const hostname = new URL(entry.url).hostname.toLowerCase();
+    if (NOISE_HOSTNAME_KEYWORDS.some((kw) => hostname.includes(kw))) return true;
+  } catch {
+    // Malformed URL — let the AI decide rather than silently dropping it
+  }
+
+  return false;
+}
+
 // ─── Prompts ────────────────────────────────────────────────────────────────
 //
 // SYSTEM PROMPT: Sets the model's role and output format once.
@@ -71,10 +155,10 @@ INTENT TYPES for search queries:
 
 CONTENT TYPES for URLs:
 - "documentation" → Official docs/API references (docs.*, developer.*)
-- "tutorial"      → Step-by-step guides (freecodecamp, medium tutorials)
+- "tutorial"      → Step-by-step guides (freecodecamp, medium tutorials, geeksforgeeks, w3schools)
 - "qa"            → Q&A threads (stackoverflow, reddit tech subs)
 - "repository"    → Source code (github, gitlab)
-- "article"       → Blog posts, essays (dev.to, substack, blog.*)
+- "article"       → Blog posts, essays (dev.to, substack, blog.*, medium)
 - "video"         → Video content (youtube.com)
 - "tool"          → Playgrounds, sandboxes (codepen, regex101)
 - "noise"         → Non-learning (social media, email, banking, shopping)
@@ -121,20 +205,46 @@ OUTPUT FORMAT (JSON array):
 export async function classifyEntries(entries: HistoryEntry[]): Promise<ClassifiedEntry[]> {
   if (entries.length === 0) return [];
 
+  // ── Step 1: Pre-filter obvious noise without touching the AI ───────────────
+  // isDefinitelyNoise() checks URL substrings and hostnames against known noise
+  // patterns (social media, email, job boards, entertainment). Matched entries
+  // get an immediate 'noise' classification — no API call, no tokens spent.
+  // Search queries always pass through to AI (too ambiguous for rule-based filtering).
+  const toClassify: HistoryEntry[]    = [];
+  const preFiltered: ClassifiedEntry[] = [];
+
+  for (const entry of entries) {
+    if (isDefinitelyNoise(entry)) {
+      preFiltered.push(fallbackClassification(entry));
+    } else {
+      toClassify.push(entry);
+    }
+  }
+
+  console.log(
+    `[classifier] Pre-filter: ${preFiltered.length} noise entries skipped, ` +
+    `${toClassify.length} entries sent to AI`
+  );
+
+  // If everything was filtered out, return early — no AI call needed
+  if (toClassify.length === 0) return preFiltered;
+
+  // ── Step 2: Classify remaining entries via DeepSeek ────────────────────────
   // Split entries into chunks of BATCH_SIZE for processing
-  const batches = chunkArray(entries, BATCH_SIZE);
+  const batches = chunkArray(toClassify, BATCH_SIZE);
   const allClassified: ClassifiedEntry[] = [];
 
   // Process batches sequentially (not in parallel) to:
   // 1. Avoid hitting rate limits
   // 2. Allow future progress tracking
-  // Future improvement: add parallel processing with rate limit awareness
   for (const batch of batches) {
     const classified = await classifyBatch(batch);
     allClassified.push(...classified);
   }
 
-  return allClassified;
+  // Combine pre-filtered noise with AI results.
+  // Order doesn't matter here — clustering works on the full set regardless.
+  return [...preFiltered, ...allClassified];
 }
 
 // ─── Batch Processing ───────────────────────────────────────────────────────
