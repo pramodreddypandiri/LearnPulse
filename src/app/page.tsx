@@ -213,13 +213,36 @@ export default function DashboardPage() {
 
   /**
    * "Clear History" — removes captured entries from the left panel.
-   * Also clears localStorage so a refresh doesn't repopulate.
-   * Does NOT reset the pipeline (posts stay visible).
+   *
+   * THREE-STEP CLEAR:
+   *   1. Clear React state immediately (left panel empties now)
+   *   2. Remove the localStorage key so a page refresh doesn't repopulate
+   *      from the web app's localStorage bridge
+   *   3. Send a postMessage to the content script (content-learnpulse.ts)
+   *      so it empties chrome.storage.local — otherwise the content script
+   *      would re-write the entries back to localStorage on the next refresh,
+   *      and the background service worker's chrome.storage.onChanged listener
+   *      will automatically reset the extension badge to 0 as a side effect.
+   *
+   * Does NOT reset the pipeline (posts stay visible after clearing history).
    */
   const handleClearHistory = useCallback(() => {
+    // Step 1: clear React state
     setCapturedEntries([]);
     setManualInput('');
+
+    // Step 2: remove the localStorage bridge so refresh doesn't repopulate
     try { localStorage.removeItem(LS_KEY); } catch { /* ignore */ }
+
+    // Step 3: notify the content script to clear chrome.storage.local
+    // The content script (content-learnpulse.ts) listens for this message
+    // and empties today's entries from chrome.storage.local. This prevents
+    // the content script from re-writing entries to localStorage on the next
+    // page refresh. The background's chrome.storage.onChanged listener will
+    // then fire and call updateBadge(), which resets the extension badge to 0.
+    try {
+      window.postMessage({ type: 'learnpulse:clear' }, window.location.origin);
+    } catch { /* ignore — postMessage is always available on localhost */ }
   }, []);
 
   /**
@@ -256,6 +279,13 @@ export default function DashboardPage() {
             <span className="text-2xl">🧠</span>
             <h1 className="text-2xl font-bold text-gray-900 tracking-tight">LearnPulse</h1>
           </div>
+          <p className="mt-1 text-sm text-gray-400">
+            Get reflective{' '}
+            <a href="https://www.linkedin.com" target="_blank" rel="noopener noreferrer" className="font-bold hover:underline rounded px-1 py-0.5" style={{ color: '#0A66C2', backgroundColor: '#e8f0fb' }}>LinkedIn</a>
+            {' '}and{' '}
+            <a href="https://x.com" target="_blank" rel="noopener noreferrer" className="font-bold hover:underline rounded px-1 py-0.5" style={{ color: '#000000', backgroundColor: '#e5e7eb' }}>X</a>
+            {' '}posts about what you actually learned
+          </p>
         </header>
 
         {/* 3-column body */}
@@ -521,6 +551,8 @@ function PostsSection({
         <PostCard
           platform="linkedin"
           label="LinkedIn"
+          href="https://www.linkedin.com"
+          labelColor="#0A66C2"
           platformIcon={
             <span className="w-5 h-5 rounded bg-[#0A66C2] flex items-center justify-center text-white text-[10px] font-bold">in</span>
           }
@@ -536,6 +568,8 @@ function PostsSection({
           <PostCard
             platform="x"
             label={editedX.length > 1 ? `X / Twitter (${editedX.length}-tweet thread)` : 'X / Twitter'}
+            href="https://x.com"
+            labelColor="#000000"
             platformIcon={
               <span className="w-5 h-5 rounded bg-black flex items-center justify-center text-white text-[10px] font-bold">𝕏</span>
             }
@@ -560,6 +594,10 @@ function PostsSection({
 interface PostCardProps {
   platform:     string;
   label:        string;
+  /** URL the platform label links to (e.g. https://linkedin.com) */
+  href:         string;
+  /** Brand color for the label link (e.g. #0A66C2 for LinkedIn, #000 for X) */
+  labelColor:   string;
   platformIcon: React.ReactNode;
   body:         string;
   hashtags:     string[];
@@ -568,7 +606,7 @@ interface PostCardProps {
   onEdit:       () => void;
 }
 
-function PostCard({ label, platformIcon, body, hashtags, isEditing, onEdit }: PostCardProps) {
+function PostCard({ label, href, labelColor, platformIcon, body, hashtags, isEditing, onEdit }: PostCardProps) {
   return (
     <div
       className={`bg-white rounded-xl border shadow-sm flex flex-col transition-all ${
@@ -578,7 +616,15 @@ function PostCard({ label, platformIcon, body, hashtags, isEditing, onEdit }: Po
       {/* Platform header */}
       <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
         {platformIcon}
-        <span className="text-sm font-semibold text-gray-800 truncate">{label}</span>
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm font-semibold truncate hover:underline"
+          style={{ color: labelColor }}
+        >
+          {label}
+        </a>
       </div>
 
       {/* Post body preview — read-only, shows first ~200 chars */}
