@@ -162,8 +162,13 @@ async function classifyBatch(batch: HistoryEntry[]): Promise<ClassifiedEntry[]> 
       // Low temperature for classification — we want deterministic, consistent output
       // Higher temperature would cause the same query to get different classifications
       temperature: 0.1,
-      // Limit response size — classification JSON is compact
-      max_tokens: 2000,
+      // Token budget calculation:
+      //   Each classification object is ~60-80 tokens (the UUID alone is ~15 tokens,
+      //   plus field names, values, commas, brackets).
+      //   A full batch of 50 entries = 50 × 80 = ~4,000 tokens.
+      //   We set 8,000 as a 2× safety margin so long topic strings don't cut us off.
+      //   Previously this was 2,000 — too small for 50 entries, causing truncated JSON.
+      max_tokens: 8000,
     });
 
     // Extract the text content from the response
@@ -240,6 +245,13 @@ interface RawClassification {
  * The model sometimes wraps JSON in markdown code blocks (```json ... ```)
  * even when instructed not to. We strip those before parsing.
  *
+ * TRUNCATION RECOVERY:
+ *   If JSON.parse fails (e.g., the response was still cut off despite the
+ *   increased max_tokens), we try to salvage whatever complete objects
+ *   are present by finding the last valid `},` boundary and closing the
+ *   array there. Any missing entries will be filled in with fallback
+ *   classifications by mergeClassifications().
+ *
  * Returns an empty array if parsing fails entirely.
  */
 function parseClassificationResponse(content: string): RawClassification[] {
@@ -249,12 +261,35 @@ function parseClassificationResponse(content: string): RawClassification[] {
     cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
 
+  // ── Primary parse ────────────────────────────────────────────────────────
   try {
     const parsed = JSON.parse(cleaned);
     return Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    console.error('[classifier] Failed to parse classification response:', error);
-    console.error('[classifier] Raw response:', content.substring(0, 500));
+  } catch (primaryError) {
+    console.error('[classifier] Failed to parse classification response:', primaryError);
+    console.error('[classifier] Raw response (first 500 chars):', content.substring(0, 500));
+
+    // ── Truncation recovery ────────────────────────────────────────────────
+    // The response was cut off mid-JSON (the model hit its token limit).
+    // Strategy: find the last "}," — the end of the last COMPLETE object
+    // before the truncation point — close the array there, and re-parse.
+    // Any entries missing from the recovered array will get a fallback
+    // 'noise' classification via mergeClassifications().
+    console.warn('[classifier] Attempting truncation recovery...');
+    const lastComplete = cleaned.lastIndexOf('},');
+    if (lastComplete !== -1) {
+      const recovered = cleaned.substring(0, lastComplete + 1) + ']';
+      try {
+        const parsed = JSON.parse(recovered);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          console.warn(`[classifier] Recovered ${parsed.length} entries from truncated response`);
+          return parsed;
+        }
+      } catch {
+        // Recovery also failed — fall through to empty return
+      }
+    }
+
     return [];
   }
 }

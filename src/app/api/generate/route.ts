@@ -54,6 +54,12 @@ const UserPreferencesSchema = z.object({
   professionalContext: z.string().max(200).optional(),
   linkedinTone: z.enum(['reflective', 'educational', 'storytelling']).optional(),
   xFormat: z.enum(['single', 'thread']).optional(),
+  // customInstructions: free-form text the user types to guide the post style.
+  // Example: "focus on the debugging journey", "write for a React developer audience".
+  // This field was previously missing — Zod strips unknown fields by default, so
+  // it was silently discarded before reaching generatePosts(). Adding it here
+  // ensures it flows through to the AI prompt in post-generator.ts.
+  customInstructions: z.string().max(1000).optional(),
 }).optional();
 
 const GenerateRequestSchema = z.object({
