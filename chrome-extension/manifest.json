@@ -52,7 +52,8 @@
     "scripting",
     "alarms",
     "notifications",
-    "tabs"
+    "tabs",
+    "webNavigation"
   ],
 
   "host_permissions": [

@@ -480,3 +480,72 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
     await updateBadge();
   }
 });
+
+// ─── Real-time URL Capture ────────────────────────────────────────────────────
+
+/**
+ * Captures URL visits in REAL TIME as the user navigates the web.
+ *
+ * WHY THIS IS NEEDED:
+ *   The backfillHistory() function only runs on install/startup.
+ *   Without this listener, URLs visited during the current session are
+ *   not saved until Chrome restarts — meaning the extension effectively
+ *   only captures searches (via content scripts) in real time.
+ *   URL visits would only appear after the next Chrome startup backfill.
+ *
+ * HOW webNavigation.onCompleted WORKS:
+ *   This event fires whenever a navigation completes (page finishes loading).
+ *   It includes the URL, tab ID, and frame ID. We only care about:
+ *   - frameId === 0: the main frame (not iframes, subresources)
+ *   - http/https URLs (not chrome://, file://, etc.)
+ *   - Not search result pages (those are already captured as 'search' by content scripts)
+ *   - Not the LearnPulse app itself (that's our UI, not a learning signal)
+ *
+ * WHY NOT USE chrome.tabs.onUpdated INSTEAD?
+ *   tabs.onUpdated fires for many non-navigation events (tab title change, loading state, etc.)
+ *   and requires host_permissions matching the tab URL to read tab.url.
+ *   webNavigation is cleaner — it fires specifically for navigations and the URL
+ *   is always available with just the webNavigation permission.
+ *
+ * DEDUPLICATION:
+ *   appendEntry() already deduplicates: it skips entries with the same URL
+ *   within the last 60 minutes. So refreshing a page won't create duplicates.
+ *
+ * HOW THIS AFFECTS THE SYSTEM:
+ *   - URL visits now appear in storage immediately (same session, no restart needed)
+ *   - The badge count updates in real time for both searches AND page visits
+ *   - When the user clicks "Analyze Now", URL visits from the current session
+ *     are included alongside searches — giving the AI richer context about
+ *     which topics the user explored in depth (not just searched for)
+ */
+chrome.webNavigation.onCompleted.addListener(async (details) => {
+  // Only capture main-frame navigations.
+  // frameId 0 = the top-level page. Other frame IDs are iframes, embedded content, etc.
+  // We don't want to capture every resource loaded inside a page — just the pages themselves.
+  if (details.frameId !== 0) return;
+
+  const url = details.url;
+
+  // Skip non-http URLs: chrome://, chrome-extension://, file://, data:, about:, etc.
+  // We only care about real web pages.
+  if (!url.startsWith('http')) return;
+
+  // Skip the LearnPulse web app itself — it's our UI, not a learning signal.
+  if (url.startsWith(LEARNPULSE_URL)) return;
+
+  // Skip search result pages — those are captured as 'search' type by content scripts.
+  // Including them here as 'visit' would cause duplication in the analysis.
+  if (isSearchResultPage(url)) return;
+
+  // Save as a 'visit' entry — same type used by the history backfill.
+  // The appendEntry() function handles deduplication (same URL within 60 min = skip).
+  const entry: CapturedEntry = {
+    type: 'visit',
+    content: url,
+    source: 'history',  // 'history' means "browsed URL" as opposed to 'google'/'perplexity'
+    timestamp: details.timeStamp,
+  };
+
+  await appendEntry(entry);
+  console.log(`[LearnPulse] Captured URL visit: ${url}`);
+});

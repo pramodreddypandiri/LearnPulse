@@ -221,4 +221,20 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
     await updateBadge();
   }
 });
+chrome.webNavigation.onCompleted.addListener(async (details) => {
+  if (details.frameId !== 0) return;
+  const url = details.url;
+  if (!url.startsWith("http")) return;
+  if (url.startsWith(LEARNPULSE_URL)) return;
+  if (isSearchResultPage(url)) return;
+  const entry = {
+    type: "visit",
+    content: url,
+    source: "history",
+    // 'history' means "browsed URL" as opposed to 'google'/'perplexity'
+    timestamp: details.timeStamp
+  };
+  await appendEntry(entry);
+  console.log(`[LearnPulse] Captured URL visit: ${url}`);
+});
 //# sourceMappingURL=background.js.map
