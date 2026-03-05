@@ -41,14 +41,18 @@ interface PostPreviewProps {
  * PostPreview — Shows LinkedIn and X posts side by side with copy actions.
  */
 export function PostPreview({ posts }: PostPreviewProps) {
+  // PostPreview shows the first LinkedIn post for a quick overview.
+  // The main page (page.tsx) handles the full multi-post editing flow.
+  const firstLinkedIn = posts.linkedinPosts[0];
+
   // Allow user to manually edit posts before copying
-  const [linkedinBody, setLinkedinBody] = useState(posts.linkedin.body);
+  const [linkedinBody, setLinkedinBody] = useState(firstLinkedIn?.body ?? '');
   const [xTweets, setXTweets] = useState(posts.x.tweets);
 
   // Full post text for copying (body + hashtags)
   const linkedinFull = [
     linkedinBody,
-    posts.linkedin.hashtags.map((h) => `#${h}`).join(' '),
+    (firstLinkedIn?.hashtags ?? []).map((h) => `#${h}`).join(' '),
   ].filter(Boolean).join('\n\n');
 
   const xFull = [
@@ -74,7 +78,7 @@ export function PostPreview({ posts }: PostPreviewProps) {
           <LinkedInPanel
             body={linkedinBody}
             onBodyChange={setLinkedinBody}
-            hashtags={posts.linkedin.hashtags}
+            hashtags={firstLinkedIn?.hashtags ?? []}
             fullText={linkedinFull}
           />
         </Card>
