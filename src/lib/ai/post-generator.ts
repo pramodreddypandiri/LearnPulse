@@ -1,7 +1,7 @@
 // ══════════════════════════════════════════════════════════════════════
 // Social Post Generator
 // src/lib/ai/post-generator.ts
-// PROMPT_V1 — 2025-03-02
+// PROMPT_V2 — 2026-03-04
 //
 // PURPOSE:
 //   Takes LearningCluster[] and generates two social media posts:
@@ -41,7 +41,7 @@
 // ══════════════════════════════════════════════════════════════════════
 
 import { deepseek, DEEPSEEK_MODEL } from './client';
-import type { LearningCluster, GeneratedPosts, UserPreferences } from '@/lib/types';
+import type { LearningCluster, LinkedInPost, GeneratedPosts, UserPreferences } from '@/lib/types';
 
 // ─── System Prompts ─────────────────────────────────────────────────────────
 
@@ -58,13 +58,18 @@ import type { LearningCluster, GeneratedPosts, UserPreferences } from '@/lib/typ
  */
 const LINKEDIN_SYSTEM_PROMPT = `You are a thoughtful technical professional writing an authentic LinkedIn post about your learning journey.
 
-VOICE: First-person, reflective, genuinely curious. You're sharing something that actually interested you — not performing "professional development."
+VOICE: First-person, reflective, genuinely curious. Write like you're telling a technically sharp friend — not a LinkedIn audience. Use contractions ("I've", "it's", "you'll"), address the reader as "you", and keep it conversational. Formal = distant. Conversational = engaging.
 
 POST STRUCTURE:
-1. Hook (1-2 sentences): Start with the problem, question, or moment that triggered the exploration. Not "Today I learned..." — start with the story.
+1. Hook (1-2 sentences): Your first sentence must make someone stop scrolling. Lead with a concrete problem that went sideways, a surprising fact, or a sharp observation — never a preamble. Not "Today I learned..." — drop them straight into the story.
 2. Journey narrative (3-5 sentences): Walk through HOW you explored the topic. Include the unexpected turns, the "wait, why does this work that way?" moments.
 3. Key insight (2-3 sentences): What was the most interesting/surprising/useful thing you discovered? Something concrete, not generic.
-4. Closing (1-2 sentences): A question for the audience, a takeaway, or a forward-looking thought. NOT "Never stop learning!"
+4. Closing (1-2 sentences): End with a punch. A concrete challenge, a question your audience will actually sit with, or a reframe that changes how they think about the topic. NOT "Never stop learning!"
+
+WRITING STYLE:
+- Vary sentence length deliberately. Long sentences build context and momentum. Short ones land the insight.
+- Use short paragraphs (2-4 lines max) with line breaks between them — white space makes posts readable.
+- Simple beats clever. Fewer, sharper sentences win over long explanations.
 
 STRICT RULES:
 - Length: 150-300 words for the body (hashtags are separate)
@@ -90,16 +95,18 @@ Include 3-5 hashtags. Technical and specific (e.g., "Python", "AsyncProgramming"
  */
 const X_SYSTEM_PROMPT = `You are writing an authentic X (Twitter) post about a technical insight from your learning session.
 
-VOICE: Conversational, slightly informal, direct. Like texting a technically-minded friend who would actually be interested.
+VOICE: Conversational, slightly informal, direct. Like texting a technically-minded friend who would actually be interested. Use contractions, be casual — formal kills engagement on X.
 
 FORMAT OPTIONS:
 - Single tweet (preferred): One punchy insight that makes people stop scrolling (max 250 chars + hashtags)
 - Thread (if story demands it): 2-3 tweets max. First tweet must stand alone as the hook.
 
 WHAT MAKES A GOOD X POST:
-- Starts with a surprising fact, a concrete problem, or a sharp observation — NOT "Thread:"
+- Your first sentence must make someone stop scrolling. Lead with a surprising fact, a concrete problem, or a sharp observation — NOT "Thread:"
 - The insight is specific enough to be useful or interesting
 - Has a "huh, I never thought about it that way" quality
+- Vary sentence length for rhythm. Short sentences hit hard. Longer ones can set up the punch.
+- For threads: the last tweet should land — summarize, challenge, or provoke. Don't just trail off.
 
 STRICT RULES:
 - Each tweet max 250 characters (leave room for hashtags)
@@ -114,32 +121,132 @@ OUTPUT FORMAT (JSON):
   "hashtags": ["hashtag1"]
 }`;
 
+// ─── Depth Ordering ──────────────────────────────────────────────────────────
+
+/**
+ * Numeric priority for each ClusterDepth level.
+ * Higher = higher priority for LinkedIn post assignment.
+ * Maps to the user-facing "depth scoring" concept:
+ *   deep     → 6+ signals (most queries + URL visits)
+ *   moderate → 3-5 signals
+ *   surface  → 1-2 signals
+ */
+const DEPTH_ORDER: Record<string, number> = {
+  deep:     3,
+  moderate: 2,
+  surface:  1,
+};
+
+/** Minimum number of LinkedIn posts to always produce */
+const TARGET_MIN_POSTS = 3;
+
+/** Maximum number of LinkedIn posts (cap to avoid overwhelming the UI) */
+const TARGET_MAX_POSTS = 4;
+
+/**
+ * Alternative writing angles used when a cluster needs to generate more than
+ * one version of its post (i.e., fewer clusters than TARGET_MIN_POSTS).
+ *
+ * The first angle (index 0) is the default — no extra instruction.
+ * Subsequent angles push the AI toward a different narrative perspective
+ * so the extra posts don't feel like duplicates.
+ */
+const VERSION_ANGLES = [
+  '', // Default — let the system prompt guide the tone
+  'Write this from a different angle: focus on the surprising or counterintuitive aspects of what was discovered.',
+  'Write this emphasizing practical application — how does this learning change real day-to-day work or production decisions?',
+];
+
+// ─── Post Assignment Planning ─────────────────────────────────────────────────
+
+/**
+ * Decides which (cluster, versionAngle) pairs to generate LinkedIn posts for.
+ *
+ * ALGORITHM:
+ *   1. Sort all clusters by depth: deep → moderate → surface
+ *   2. Assign one post per cluster (up to TARGET_MAX_POSTS = 4)
+ *   3. If we still have fewer than TARGET_MIN_POSTS = 3, fill the gap by
+ *      generating extra versions of the highest-depth cluster(s) using
+ *      different writing angles from VERSION_ANGLES.
+ *
+ * EXAMPLES:
+ *   1 cluster  → [cluster0/angle0, cluster0/angle1, cluster0/angle2]  (3 posts)
+ *   2 clusters → [cluster0/angle0, cluster1/angle0, cluster0/angle1]  (3 posts)
+ *   3 clusters → [cluster0/angle0, cluster1/angle0, cluster2/angle0]  (3 posts)
+ *   4+ clusters→ top 4 clusters, one post each                        (4 posts)
+ */
+function planLinkedInPosts(
+  clusters: LearningCluster[]
+): Array<{ cluster: LearningCluster; angle: string }> {
+  // Sort deepest engagement first
+  const sorted = [...clusters].sort(
+    (a, b) => (DEPTH_ORDER[b.depth] ?? 0) - (DEPTH_ORDER[a.depth] ?? 0)
+  );
+
+  const plans: Array<{ cluster: LearningCluster; angle: string }> = [];
+
+  // Step 1: one post per cluster (up to the hard cap)
+  for (const cluster of sorted.slice(0, TARGET_MAX_POSTS)) {
+    plans.push({ cluster, angle: VERSION_ANGLES[0] });
+  }
+
+  // Step 2: fill up to the minimum with extra versions of the top cluster
+  if (plans.length < TARGET_MIN_POSTS && sorted.length > 0) {
+    plans.push({ cluster: sorted[0], angle: VERSION_ANGLES[1] });
+  }
+  if (plans.length < TARGET_MIN_POSTS && sorted.length > 0) {
+    // Use the second cluster for variety if available, otherwise stay on top cluster
+    const fillCluster = sorted.length > 1 ? sorted[1] : sorted[0];
+    const fillAngle   = sorted.length > 1 ? VERSION_ANGLES[1] : VERSION_ANGLES[2];
+    plans.push({ cluster: fillCluster, angle: fillAngle });
+  }
+
+  return plans;
+}
+
 // ─── Main Function ──────────────────────────────────────────────────────────
 
 /**
- * Generates LinkedIn and X posts from learning clusters.
+ * Generates 3-4 LinkedIn posts (one per cluster, depth-ordered) and one X post.
  *
- * Both posts are generated simultaneously using Promise.all for performance.
- * Each uses a different system prompt to create genuinely different outputs.
+ * HOW IT WORKS:
+ *   1. planLinkedInPosts() decides which clusters get posts and whether any
+ *      cluster needs a second version (when total clusters < 3).
+ *   2. All LinkedIn posts are generated in PARALLEL (Promise.all) — each is an
+ *      independent API call scoped to a single cluster, so they don't block
+ *      each other.
+ *   3. The X post is generated from all clusters together (it uses the best
+ *      overall signal to find the sharpest single insight).
+ *   4. All calls run concurrently — total wall-clock time ≈ slowest single call.
  *
- * @param clusters - Learning clusters ordered by depth (deepest first)
- * @param preferences - Optional user context (role, preferred tone, etc.)
- * @returns GeneratedPosts with both LinkedIn and X content
+ * @param clusters - Learning clusters from /api/cluster
+ * @param preferences - Optional user context (tone, role, custom instructions)
+ * @returns GeneratedPosts with linkedinPosts[] array and one x post
  */
 export async function generatePosts(
   clusters: LearningCluster[],
   preferences?: UserPreferences
 ): Promise<GeneratedPosts> {
-  const userPrompt = buildGenerationPrompt(clusters, preferences);
+  // Plan which clusters generate which posts
+  const assignments = planLinkedInPosts(clusters);
 
-  // Run both post generations simultaneously — saves ~3-5 seconds vs. sequential
-  const [linkedinResult, xResult] = await Promise.all([
-    generateLinkedInPost(userPrompt),
-    generateXPost(userPrompt),
+  // Build the X post prompt from all clusters (for the broadest signal)
+  const xPrompt = buildXPrompt(clusters, preferences);
+
+  // Run all LinkedIn generations + the X generation in parallel
+  const [linkedinPosts, xResult] = await Promise.all([
+    // LinkedIn: one API call per assignment, all in parallel
+    Promise.all(
+      assignments.map(({ cluster, angle }) =>
+        generateLinkedInPost(cluster, preferences, angle)
+      )
+    ),
+    // X: single call covering all clusters
+    generateXPost(xPrompt),
   ]);
 
   return {
-    linkedin: linkedinResult,
+    linkedinPosts,
     x: xResult,
     generatedAt: new Date(),
     basedOn: clusters,
@@ -149,12 +256,24 @@ export async function generatePosts(
 // ─── Post Generators ─────────────────────────────────────────────────────────
 
 /**
- * Generates the LinkedIn post.
- * Returns a fallback post if the API call or parsing fails.
+ * Generates one LinkedIn post from a single learning cluster.
+ *
+ * Each LinkedIn post is scoped to one cluster — this keeps the narrative
+ * focused on a single learning journey rather than trying to merge multiple
+ * topics into one post.
+ *
+ * @param cluster      - The specific learning cluster to write about
+ * @param preferences  - Optional user preferences (tone, role, instructions)
+ * @param versionAngle - Extra instruction when generating a 2nd/3rd version of
+ *                       the same cluster (steers toward a different narrative angle)
  */
 async function generateLinkedInPost(
-  userPrompt: string
-): Promise<GeneratedPosts['linkedin']> {
+  cluster: LearningCluster,
+  preferences?: UserPreferences,
+  versionAngle = '',
+): Promise<LinkedInPost> {
+  const userPrompt = buildLinkedInPrompt(cluster, preferences, versionAngle);
+
   try {
     const response = await deepseek.chat.completions.create({
       model: DEEPSEEK_MODEL,
@@ -163,7 +282,6 @@ async function generateLinkedInPost(
         { role: 'user', content: userPrompt },
       ],
       // Higher temperature for more creative, authentic-feeling writing
-      // Lower would make it sound more formulaic
       temperature: 0.7,
       max_tokens: 800,
     });
@@ -171,7 +289,7 @@ async function generateLinkedInPost(
     const content = response.choices[0]?.message?.content;
     if (!content) throw new Error('Empty response');
 
-    return parseLinkedInResponse(content);
+    return parseLinkedInResponse(content, cluster.id, cluster.name);
 
   } catch (error) {
     console.error('[post-generator] LinkedIn generation failed:', error);
@@ -179,12 +297,14 @@ async function generateLinkedInPost(
       body: 'Unable to generate LinkedIn post. Please try again.',
       hashtags: [],
       characterCount: 0,
+      clusterId: cluster.id,
+      clusterName: cluster.name,
     };
   }
 }
 
 /**
- * Generates the X/Twitter post.
+ * Generates the X/Twitter post from all clusters.
  * Returns a fallback if generation fails.
  */
 async function generateXPost(
@@ -220,45 +340,93 @@ async function generateXPost(
 // ─── Prompt Building ─────────────────────────────────────────────────────────
 
 /**
- * Builds the shared user prompt used for both LinkedIn and X generation.
+ * Builds the user prompt for a SINGLE LinkedIn post from one cluster.
  *
- * We include:
- * - The clusters ordered by depth (deepest first = most interesting first)
- * - The raw queries from each cluster (for authenticity — real wording)
- * - The narrative and inferred goal (for story context)
- * - User preferences (if provided)
+ * Scoping the prompt to one cluster keeps the AI focused on one narrative.
+ * A shared multi-cluster prompt risks producing a vague, blended post that
+ * doesn't do justice to any single topic.
+ *
+ * @param cluster      - The cluster to write about
+ * @param preferences  - Optional user context
+ * @param versionAngle - Extra angle instruction for extra post versions (may be empty)
+ */
+function buildLinkedInPrompt(
+  cluster: LearningCluster,
+  preferences?: UserPreferences,
+  versionAngle = '',
+): string {
+  // Serialize the single cluster for the AI
+  const clusterData = {
+    name:         cluster.name,
+    depth:        cluster.depth,
+    inferredGoal: cluster.inferredGoal,
+    narrative:    cluster.narrative,
+    // Real queries and URLs — the AI uses these to write specific, authentic content
+    rawEntries: cluster.entries.map((e) => ({
+      type:    e.source,
+      content: e.source === 'search' ? e.query : e.url,
+      intent:  e.intent,
+    })),
+    keywords: cluster.keywords,
+  };
+
+  const contextLines: string[] = [];
+
+  // Priority: user's custom instructions override everything
+  if (preferences?.customInstructions) {
+    contextLines.push(`PRIORITY INSTRUCTIONS FROM THE USER:\n${preferences.customInstructions}`);
+  }
+  if (preferences?.professionalContext) {
+    contextLines.push(`User background: ${preferences.professionalContext}`);
+  }
+  // Version angle: steers extra post versions toward a different narrative
+  if (versionAngle) {
+    contextLines.push(`ANGLE FOR THIS POST: ${versionAngle}`);
+  }
+
+  const contextBlock = contextLines.length > 0
+    ? `\n\n${contextLines.join('\n\n')}`
+    : '';
+
+  return `Generate a LinkedIn post about this specific learning journey:${contextBlock}
+
+<learning_data>
+${JSON.stringify(clusterData, null, 2)}
+</learning_data>
+
+Use the real queries and narrative to write a post that sounds specific and authentic.`;
+}
+
+/**
+ * Builds the shared prompt for the X/Twitter post.
+ *
+ * X gets ALL clusters — the AI picks the single sharpest insight across
+ * everything the user learned. A single tweet can't cover multiple topics
+ * anyway, so the AI naturally focuses on whatever is most interesting.
  *
  * Wrapping in <learning_data> XML tags for prompt injection safety.
  */
-function buildGenerationPrompt(
+function buildXPrompt(
   clusters: LearningCluster[],
   preferences?: UserPreferences
 ): string {
   const clusterDescriptions = clusters.map((cluster) => ({
-    name: cluster.name,
-    depth: cluster.depth,
+    name:         cluster.name,
+    depth:        cluster.depth,
     inferredGoal: cluster.inferredGoal,
-    narrative: cluster.narrative,
-    // Include actual query/URL text for authenticity — the model uses these
-    // to write post content that sounds specific and real
-    rawEntries: cluster.entries.map((e) => ({
-      type: e.source,
+    narrative:    cluster.narrative,
+    rawEntries:   cluster.entries.map((e) => ({
+      type:    e.source,
       content: e.source === 'search' ? e.query : e.url,
-      intent: e.intent,
+      intent:  e.intent,
     })),
     keywords: cluster.keywords,
   }));
 
-  // Build the preference/instruction context block.
-  // customInstructions is placed first and labelled as PRIORITY so the model
-  // treats it as a hard constraint, not a soft suggestion.
   const contextLines: string[] = [];
-
   if (preferences?.customInstructions) {
-    // Mark as high-priority so the model doesn't override it with defaults
     contextLines.push(`PRIORITY INSTRUCTIONS FROM THE USER:\n${preferences.customInstructions}`);
   }
-
   if (preferences?.professionalContext) {
     contextLines.push(`User background: ${preferences.professionalContext}`);
   }
@@ -267,21 +435,27 @@ function buildGenerationPrompt(
     ? `\n\n${contextLines.join('\n\n')}`
     : '';
 
-  return `Generate a post based on this learning session data:${contextBlock}
+  return `Generate an X post from this learning session data:${contextBlock}
 
 <learning_data>
 ${JSON.stringify(clusterDescriptions, null, 2)}
 </learning_data>
 
-Focus on the deepest/most interesting cluster. Use real queries to make the post specific and authentic.`;
+Pick the single sharpest insight from any cluster. Use real queries for specificity.`;
 }
 
 // ─── Response Parsers ─────────────────────────────────────────────────────────
 
 /**
  * Parses the LinkedIn post from the AI's JSON response.
+ * clusterId and clusterName are passed in (not from the AI) to populate
+ * the LinkedInPost metadata fields.
  */
-function parseLinkedInResponse(content: string): GeneratedPosts['linkedin'] {
+function parseLinkedInResponse(
+  content: string,
+  clusterId: string,
+  clusterName: string,
+): LinkedInPost {
   const parsed = parseJsonResponse(content);
 
   if (!parsed || typeof parsed.body !== 'string') {
@@ -291,6 +465,8 @@ function parseLinkedInResponse(content: string): GeneratedPosts['linkedin'] {
       body: cleaned,
       hashtags: [],
       characterCount: cleaned.length,
+      clusterId,
+      clusterName,
     };
   }
 
@@ -299,9 +475,11 @@ function parseLinkedInResponse(content: string): GeneratedPosts['linkedin'] {
   const totalLength = parsed.body.length + (hashtagText ? hashtagText.length + 1 : 0);
 
   return {
-    body: parsed.body,
+    body: parsed.body as string,
     hashtags,
     characterCount: totalLength,
+    clusterId,
+    clusterName,
   };
 }
 
