@@ -46,15 +46,21 @@ import { Button } from '@/components/ui';
 import { PipelineStatus, ClusterGrid } from '@/components/dashboard';
 import { CopyButton } from '@/components/posts/CopyButton';
 import { parseInput } from '@/lib/parsers';
-import type { HistoryEntry, GeneratedPosts, LearningCluster } from '@/lib/types';
+import type { HistoryEntry, GeneratedPosts, LearningCluster, LinkedInPost } from '@/lib/types';
 
 // localStorage key — must match WEB_APP_LS_KEY in chrome-extension/src/types.ts
 const LS_KEY = 'learnpulse_entries';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-/** Which post is currently loaded in the right edit panel */
-type EditingPost = 'linkedin' | 'x' | null;
+/**
+ * Which post is currently loaded in the right edit panel.
+ *
+ * For LinkedIn, we track the array index so the correct post is loaded
+ * into the editor when the user clicks "Edit" on one of the 3-4 cards.
+ * For X there's only one post so no index is needed.
+ */
+type EditingPost = { type: 'linkedin'; index: number } | { type: 'x' } | null;
 
 // ─── Page ────────────────────────────────────────────────────────────────────
 
@@ -90,27 +96,51 @@ export default function DashboardPage() {
   const [editedPosts, setEditedPosts] = useState<GeneratedPosts | null>(null);
 
   // ── Derived display values for the edit panel ──────────────────────────────
+  //
   // When the user hasn't made any manual edits (editedPosts is null), we fall
   // back to the pipeline's output (state.posts). Once the user edits or
   // regenerates, editedPosts holds the active values.
-  const currentPosts       = editedPosts ?? state.posts;
-  const editedLinkedIn     = currentPosts?.linkedin.body     ?? '';
-  const editedLinkedInTags = currentPosts?.linkedin.hashtags ?? [];
-  const editedX            = currentPosts?.x.tweets          ?? [];
-  const editedXTags        = currentPosts?.x.hashtags        ?? [];
+  //
+  // For LinkedIn, we now have an ARRAY of posts (one per cluster). The edit
+  // panel shows one post at a time, indexed by editingPost.index. We derive
+  // `activeLinkedInPost` for the currently-open editor and `linkedinPosts`
+  // for the PostsSection to render all cards.
+  const currentPosts = editedPosts ?? state.posts;
+
+  // Full LinkedIn post array — rendered as individual cards in PostsSection
+  const linkedinPosts: LinkedInPost[] = currentPosts?.linkedinPosts ?? [];
+
+  // Index of the LinkedIn post currently open in the right edit panel
+  const editingLinkedInIndex = editingPost?.type === 'linkedin' ? editingPost.index : 0;
+
+  // The active LinkedIn post data (body + hashtags) fed into the editor
+  const activeLinkedInPost = linkedinPosts[editingLinkedInIndex];
+  const editedLinkedIn     = activeLinkedInPost?.body     ?? '';
+  const editedLinkedInTags = activeLinkedInPost?.hashtags ?? [];
+
+  // X post is always a single entry
+  const editedX    = currentPosts?.x.tweets  ?? [];
+  const editedXTags = currentPosts?.x.hashtags ?? [];
 
   // ── Field-level setters — update one field, preserve the rest ─────────────
-  // Each setter spreads the current post state and overrides one field.
-  // They're plain functions (not useCallback) because they capture currentPosts
-  // from the current render — wrapping in useCallback would require currentPosts
-  // as a dependency and offer no meaningful benefit here.
-  const setEditedLinkedIn = (body: string) => {
+  //
+  // LinkedIn setters are index-based: only the post at `index` is replaced,
+  // all other posts in the array are preserved via map().
+  // The index is bound at the call site (EditPanel call in JSX) so EditPanel
+  // itself stays index-unaware and its interface doesn't change.
+  const setEditedLinkedInBody = (index: number, body: string) => {
     if (!currentPosts) return;
-    setEditedPosts({ ...currentPosts, linkedin: { ...currentPosts.linkedin, body } });
+    const updated = currentPosts.linkedinPosts.map((p, i) =>
+      i === index ? { ...p, body } : p
+    );
+    setEditedPosts({ ...currentPosts, linkedinPosts: updated });
   };
-  const setEditedLinkedInTags = (hashtags: string[]) => {
+  const setEditedLinkedInHashtags = (index: number, hashtags: string[]) => {
     if (!currentPosts) return;
-    setEditedPosts({ ...currentPosts, linkedin: { ...currentPosts.linkedin, hashtags } });
+    const updated = currentPosts.linkedinPosts.map((p, i) =>
+      i === index ? { ...p, hashtags } : p
+    );
+    setEditedPosts({ ...currentPosts, linkedinPosts: updated });
   };
   const setEditedX = (tweets: string[]) => {
     if (!currentPosts) return;
@@ -465,18 +495,22 @@ export default function DashboardPage() {
             {/* Your Posts */}
             {state.stage === 'complete' && state.posts && (
               <PostsSection
-                posts={state.posts}
-                editedLinkedIn={editedLinkedIn}
-                editedLinkedInTags={editedLinkedInTags}
+                linkedinPosts={linkedinPosts}
                 editedX={editedX}
                 editedXTags={editedXTags}
                 editingPost={editingPost}
-                onEditLinkedIn={() => {
-                  setEditingPost((p) => p === 'linkedin' ? null : 'linkedin');
+                basedOnCount={state.posts.basedOn.length}
+                onEditLinkedIn={(index) => {
+                  // Toggle: clicking the same card again closes the edit panel
+                  setEditingPost((p) =>
+                    p?.type === 'linkedin' && p.index === index
+                      ? null
+                      : { type: 'linkedin', index }
+                  );
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
                 onEditX={() => {
-                  setEditingPost((p) => p === 'x' ? null : 'x');
+                  setEditingPost((p) => p?.type === 'x' ? null : { type: 'x' });
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
               />
@@ -490,8 +524,8 @@ export default function DashboardPage() {
               linkedIn={{ body: editedLinkedIn, hashtags: editedLinkedInTags }}
               x={{ tweets: editedX, hashtags: editedXTags }}
               clusters={state.clusters}
-              onLinkedInChange={setEditedLinkedIn}
-              onLinkedInTagsChange={setEditedLinkedInTags}
+              onLinkedInChange={(body) => setEditedLinkedInBody(editingLinkedInIndex, body)}
+              onLinkedInTagsChange={(tags) => setEditedLinkedInHashtags(editingLinkedInIndex, tags)}
               onXChange={setEditedX}
               onXTagsChange={setEditedXTags}
               onClose={() => setEditingPost(null)}
@@ -507,153 +541,450 @@ export default function DashboardPage() {
 
 // ─── Posts Section ────────────────────────────────────────────────────────────
 //
-// Shows LinkedIn and X posts as read-only cards with EDIT buttons.
-// Clicking EDIT activates the right panel for full editing.
-// The card is highlighted (ring) when it's currently being edited.
+// Tab-based layout: [ LinkedIn ] [ X ]
+// User switches between platforms via tabs at the top.
+// LinkedIn tab: one card per cluster, stacked vertically, styled like a real
+//               LinkedIn post (profile header, body, reactions, action bar).
+// X tab:        single card styled like a real tweet.
+//
+// The "Edit" button on each card opens the right-side EditPanel for full editing.
+// The active card is highlighted with the platform's brand color when editing.
 
 interface PostsSectionProps {
-  posts:               GeneratedPosts;
-  editedLinkedIn:      string;
-  editedLinkedInTags:  string[];
-  editedX:             string[];
-  editedXTags:         string[];
-  editingPost:         EditingPost;
-  onEditLinkedIn:      () => void;
-  onEditX:             () => void;
+  /**
+   * LinkedIn posts array — one per cluster (3-4 posts), depth-ordered.
+   * Already contains any user edits (merged from editedPosts state in the page).
+   */
+  linkedinPosts:   LinkedInPost[];
+  /** Tweets for the X post (1 or more for a thread) */
+  editedX:         string[];
+  /** Hashtags for the X post */
+  editedXTags:     string[];
+  editingPost:     EditingPost;
+  /** How many learning clusters were used — shown in the subtitle */
+  basedOnCount:    number;
+  /** Called with the 0-based index of the LinkedIn post the user clicked Edit on */
+  onEditLinkedIn:  (index: number) => void;
+  onEditX:         () => void;
 }
 
 function PostsSection({
-  posts,
-  editedLinkedIn,
-  editedLinkedInTags,
+  linkedinPosts,
   editedX,
   editedXTags,
   editingPost,
+  basedOnCount,
   onEditLinkedIn,
   onEditX,
 }: PostsSectionProps) {
+  // Which platform tab is active — LinkedIn or X.
+  // Defaults to LinkedIn since those posts are the primary output.
+  const [activeTab, setActiveTab] = useState<'linkedin' | 'x'>('linkedin');
+
   return (
     <section>
-      <h2 className="text-base font-semibold text-gray-900 mb-3">Your Posts</h2>
-      <p className="text-xs text-gray-400 mb-4">
-        Generated from {posts.basedOn.length} learning {posts.basedOn.length === 1 ? 'journey' : 'journeys'}.
-        Click <span className="font-medium">Edit</span> to open the post in the edit panel.
-      </p>
+      {/* Section header */}
+      <div className="mb-4">
+        <h2 className="text-base font-semibold text-gray-900">Your Posts</h2>
+        <p className="text-xs text-gray-400 mt-0.5">
+          From {basedOnCount} learning {basedOnCount === 1 ? 'journey' : 'journeys'} ·{' '}
+          Click <span className="font-medium text-gray-500">Edit</span> to customise before copying
+        </p>
+      </div>
 
+      {/* ── Platform tabs ────────────────────────────────────────────────── */}
       {/*
-        Two-column grid matching the sketch:
-        Left column  → LinkedIn (single tall card)
-        Right column → X / Twitter (one card per tweet, stacked)
+        Tab indicator uses the platform's brand color for the active underline
+        and badge. The inactive tab sits grey and gains color on hover.
       */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="flex border-b border-gray-200 mb-5">
+        <button
+          onClick={() => setActiveTab('linkedin')}
+          className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${
+            activeTab === 'linkedin'
+              ? 'border-[#0A66C2] text-[#0A66C2]'
+              : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+          }`}
+        >
+          <span className="w-4 h-4 rounded bg-[#0A66C2] flex items-center justify-center text-white text-[9px] font-bold flex-shrink-0">in</span>
+          LinkedIn
+          {/* Badge showing post count */}
+          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-normal ${
+            activeTab === 'linkedin' ? 'bg-[#e8f0fb] text-[#0A66C2]' : 'bg-gray-100 text-gray-500'
+          }`}>
+            {linkedinPosts.length}
+          </span>
+        </button>
 
-        {/* LinkedIn card */}
-        <PostCard
-          platform="linkedin"
-          label="LinkedIn"
-          href="https://www.linkedin.com"
-          labelColor="#0A66C2"
-          platformIcon={
-            <span className="w-5 h-5 rounded bg-[#0A66C2] flex items-center justify-center text-white text-[10px] font-bold">in</span>
-          }
-          body={editedLinkedIn}
-          hashtags={editedLinkedInTags}
-          charLimit={3000}
-          isEditing={editingPost === 'linkedin'}
-          onEdit={onEditLinkedIn}
-        />
+        <button
+          onClick={() => setActiveTab('x')}
+          className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${
+            activeTab === 'x'
+              ? 'border-black text-black'
+              : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+          }`}
+        >
+          <span className="w-4 h-4 rounded bg-black flex items-center justify-center text-white text-[9px] font-bold flex-shrink-0">𝕏</span>
+          X / Twitter
+        </button>
+      </div>
 
-        {/* X tweets (stacked) */}
-        <div className="space-y-4">
-          <PostCard
-            platform="x"
-            label={editedX.length > 1 ? `X / Twitter (${editedX.length}-tweet thread)` : 'X / Twitter'}
-            href="https://x.com"
-            labelColor="#000000"
-            platformIcon={
-              <span className="w-5 h-5 rounded bg-black flex items-center justify-center text-white text-[10px] font-bold">𝕏</span>
-            }
-            body={editedX.join('\n\n— — —\n\n')}
+      {/* ── LinkedIn posts ───────────────────────────────────────────────── */}
+      {/*
+        One card per cluster, stacked vertically. Each card looks like a real
+        LinkedIn post so the user can visualise how it will appear once posted.
+        Cluster name shows under the profile name so the user knows which
+        learning journey each post is about.
+      */}
+      {activeTab === 'linkedin' && (
+        <div className="space-y-5">
+          {linkedinPosts.map((post, index) => (
+            <LinkedInPostCard
+              key={`${post.clusterId}-${index}`}
+              post={post}
+              isEditing={editingPost?.type === 'linkedin' && editingPost.index === index}
+              onEdit={() => onEditLinkedIn(index)}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* ── X post ───────────────────────────────────────────────────────── */}
+      {activeTab === 'x' && (
+        <div className="max-w-lg">
+          <XPostCard
+            tweets={editedX}
             hashtags={editedXTags}
-            charLimit={280 * editedX.length}
-            isEditing={editingPost === 'x'}
+            isEditing={editingPost?.type === 'x'}
             onEdit={onEditX}
           />
         </div>
-      </div>
+      )}
     </section>
   );
 }
 
-// ─── Post Card ────────────────────────────────────────────────────────────────
+// ─── LinkedIn Post Card ───────────────────────────────────────────────────────
 //
-// A read-only preview of a single post.
-// Shows the platform header, a truncated body preview, hashtags, and an EDIT button.
-// Highlighted with an indigo ring when it's currently loaded in the edit panel.
+// Styled to look like a real LinkedIn post so the user can see how it will
+// appear once posted. Shows a placeholder profile, the full post body, hashtags,
+// mock engagement stats, and a row of action buttons — all decorative except
+// the "Edit" button which opens the right-side EditPanel.
+//
+// The card is highlighted with LinkedIn blue when it's being edited.
 
-interface PostCardProps {
-  platform:     string;
-  label:        string;
-  /** URL the platform label links to (e.g. https://linkedin.com) */
-  href:         string;
-  /** Brand color for the label link (e.g. #0A66C2 for LinkedIn, #000 for X) */
-  labelColor:   string;
-  platformIcon: React.ReactNode;
-  body:         string;
-  hashtags:     string[];
-  charLimit:    number;
-  isEditing:    boolean;
-  onEdit:       () => void;
-}
+function LinkedInPostCard({
+  post,
+  isEditing,
+  onEdit,
+}: {
+  post:      LinkedInPost;
+  isEditing: boolean;
+  onEdit:    () => void;
+}) {
+  // Track clipboard copy state — shows "Copied!" for 2 seconds then resets
+  const [copied, setCopied] = useState(false);
 
-function PostCard({ label, href, labelColor, platformIcon, body, hashtags, isEditing, onEdit }: PostCardProps) {
+  // Full text that gets copied: post body + hashtags as "#tag #tag" on a new line
+  const fullText = [
+    post.body,
+    post.hashtags.map((h) => `#${h}`).join(' '),
+  ].filter(Boolean).join('\n\n');
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(fullText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard API unavailable — fail silently
+    }
+  };
+
   return (
     <div
-      className={`bg-white rounded-xl border shadow-sm flex flex-col transition-all ${
-        isEditing ? 'border-indigo-400 ring-2 ring-indigo-100' : 'border-gray-200'
+      className={`bg-white rounded-2xl border shadow-sm overflow-hidden transition-all duration-200 ${
+        isEditing
+          ? 'border-[#0A66C2] ring-2 ring-[#0A66C2]/10'
+          : 'border-gray-200 hover:border-gray-300'
       }`}
     >
-      {/* Platform header */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
-        {platformIcon}
-        <a
-          href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-sm font-semibold truncate hover:underline"
-          style={{ color: labelColor }}
-        >
-          {label}
-        </a>
-      </div>
+      {/* ── Post header ───────────────────────────────────────────────────── */}
+      <div className="px-4 pt-4 pb-3">
+        <div className="flex items-start gap-3">
+          {/* Profile picture placeholder — checkerboard pattern matching the mockup */}
+          <div
+            className="w-12 h-12 rounded-full flex-shrink-0 border border-gray-200"
+            style={{
+              backgroundImage:
+                'repeating-conic-gradient(#d1d5db 0% 25%, #e5e7eb 0% 50%)',
+              backgroundSize: '8px 8px',
+            }}
+          />
 
-      {/* Post body preview — read-only, shows first ~200 chars */}
-      <div className="px-4 py-3 flex-1">
-        <p className="text-xs text-gray-600 leading-relaxed whitespace-pre-wrap line-clamp-6">
-          {body || <span className="text-gray-300 italic">No content yet</span>}
-        </p>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                {/* Cluster name as the post "author role" — tells the user which
+                    learning journey this post is about */}
+                <p className="text-sm font-semibold text-gray-900 leading-tight truncate">
+                  Your Name
+                </p>
+                <p className="text-xs text-gray-500 mt-0.5 truncate" title={post.clusterName}>
+                  {post.clusterName}
+                </p>
+                <div className="flex items-center gap-1 text-xs text-gray-400 mt-0.5">
+                  <span>1w</span>
+                  <span>•</span>
+                  <span>Edited</span>
+                  <span>•</span>
+                  {/* Globe icon = public visibility */}
+                  <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor" aria-label="Public">
+                    <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm5.85 5h-2.11a9.4 9.4 0 0 0-.83-2.38A6.02 6.02 0 0 1 13.85 5zM8 1.04c.75 1.02 1.32 2.15 1.66 3.46H6.34C6.68 3.19 7.25 2.06 8 1.04zM2.15 5a6.02 6.02 0 0 1 2.94-2.38A9.4 9.4 0 0 0 4.26 5H2.15zm-.11 1h2.2c-.06.65-.1 1.32-.1 2s.04 1.35.1 2h-2.2A6.01 6.01 0 0 1 2.04 8c0-.69.05-1.36.15-2zm.26 5h2.11c.22.85.51 1.65.9 2.38A6.02 6.02 0 0 1 2.3 11zm5.7 3.96c-.75-1.02-1.32-2.15-1.66-3.46h3.32c-.34 1.31-.91 2.44-1.66 3.46zm0-4.46H5.66A10.7 10.7 0 0 1 5.5 8c0-.72.06-1.38.16-2.5h4.68C10.44 6.62 10.5 7.28 10.5 8s-.06 1.38-.16 2.5H8zM11.74 11h2.11a6.02 6.02 0 0 1-2.94 2.38c.39-.73.68-1.53.9-2.38zm.22-1c.06-.65.1-1.32.1-2s-.04-1.35-.1-2h2.2c.1.64.15 1.31.15 2s-.05 1.36-.15 2h-2.2zm-1.38-7.38c.39.73.68 1.53.9 2.38h-2.11c.21-.85.5-1.64.9-2.38z"/>
+                  </svg>
+                </div>
+              </div>
 
-        {/* Hashtags */}
-        {hashtags.length > 0 && (
-          <div className="mt-2 flex flex-wrap gap-1">
-            {hashtags.map((h) => (
-              <span key={h} className="text-xs text-indigo-500 font-medium">#{h}</span>
+              {/* Controls: Edit + Copy buttons + decorative ••• menu */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={onEdit}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                    isEditing
+                      ? 'bg-[#0A66C2]/10 text-[#0A66C2] border-[#0A66C2]/30 font-semibold'
+                      : 'text-gray-500 border-gray-200 hover:bg-gray-50 hover:border-gray-300'
+                  }`}
+                >
+                  {isEditing ? 'Editing…' : 'Edit'}
+                </button>
+                {/* Copy button — copies the full post (body + hashtags) to clipboard */}
+                <button
+                  onClick={handleCopy}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                    copied
+                      ? 'bg-green-50 text-green-600 border-green-200 font-semibold'
+                      : 'text-gray-500 border-gray-200 hover:bg-gray-50 hover:border-gray-300'
+                  }`}
+                >
+                  {copied ? '✓ Copied' : 'Copy'}
+                </button>
+                <span className="text-gray-400 text-base font-bold leading-none select-none" aria-hidden>•••</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Post body ───────────────────────────────────────────────────── */}
+        {/*
+          Show the full post body — no line-clamp — so the user can review the
+          complete text before copying. Long posts are naturally tall cards.
+        */}
+        <div className="mt-3 text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
+          {post.body || <span className="text-gray-400 italic">No content generated yet</span>}
+        </div>
+
+        {/* Hashtags in LinkedIn blue — matches how they appear on the platform */}
+        {post.hashtags.length > 0 && (
+          <div className="mt-2.5 flex flex-wrap gap-1">
+            {post.hashtags.map((h) => (
+              <span key={h} className="text-sm text-[#0A66C2] font-medium">#{h}</span>
             ))}
           </div>
         )}
       </div>
 
-      {/* EDIT button */}
-      <div className="px-4 py-3 border-t border-gray-100 flex justify-end">
-        <button
-          onClick={onEdit}
-          className={`px-3 py-1 text-xs font-medium rounded-lg border transition-colors ${
-            isEditing
-              ? 'bg-indigo-50 text-indigo-600 border-indigo-300'
-              : 'text-gray-600 border-gray-200 hover:bg-gray-50 hover:border-gray-300'
-          }`}
-        >
-          {isEditing ? 'Editing…' : 'Edit'}
+      {/* ── Engagement row (decorative) ────────────────────────────────────── */}
+      <div className="px-4 py-2 flex items-center justify-between">
+        <div className="flex items-center gap-1 text-xs text-gray-500">
+          <span>👍</span><span>❤️</span>
+          <span className="ml-0.5">1,034</span>
+        </div>
+        <span className="text-xs text-gray-500 hover:underline cursor-pointer">
+          15 comments · 17 reposts
+        </span>
+      </div>
+
+      {/* ── Action bar (decorative) ─────────────────────────────────────────── */}
+      <div className="px-1 py-1 border-t border-gray-100 flex items-center justify-around">
+        {[
+          { label: 'Like',    icon: (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3H14z"/><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>
+          )},
+          { label: 'Comment', icon: (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          )},
+          { label: 'Repost',  icon: (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          )},
+          { label: 'Send',    icon: (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          )},
+        ].map(({ label, icon }) => (
+          <button
+            key={label}
+            className="flex items-center gap-1.5 px-3 py-2.5 text-xs font-semibold text-gray-500 hover:bg-gray-100 hover:text-gray-700 rounded-lg transition-colors flex-1 justify-center"
+          >
+            {icon}
+            <span className="hidden sm:inline">{label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── X Post Card ─────────────────────────────────────────────────────────────
+//
+// Styled to look like a real tweet. Shows a placeholder profile, the tweet text
+// (or thread), mock engagement stats, and action icons — all decorative except
+// the "Edit" button. Highlighted with a dark border when being edited.
+
+function XPostCard({
+  tweets,
+  hashtags,
+  isEditing,
+  onEdit,
+}: {
+  tweets:    string[];
+  hashtags:  string[];
+  isEditing: boolean;
+  onEdit:    () => void;
+}) {
+  // Track clipboard copy state — shows "✓ Copied" for 2 seconds then resets
+  const [copied, setCopied] = useState(false);
+
+  // Full text: thread tweets joined by blank lines, then hashtags on a new line
+  const fullText = [
+    tweets.join('\n\n'),
+    hashtags.map((h) => `#${h}`).join(' '),
+  ].filter(Boolean).join('\n\n');
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(fullText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard API unavailable — fail silently
+    }
+  };
+
+  return (
+    <div
+      className={`bg-white rounded-2xl border shadow-sm overflow-hidden transition-all duration-200 ${
+        isEditing
+          ? 'border-gray-800 ring-2 ring-gray-200'
+          : 'border-gray-200 hover:border-gray-300'
+      }`}
+    >
+      {/* ── Tweet header ─────────────────────────────────────────────────── */}
+      <div className="px-4 pt-4 pb-2">
+        <div className="flex items-start gap-3">
+          {/* Profile pic placeholder */}
+          <div
+            className="w-10 h-10 rounded-full flex-shrink-0 border border-gray-200"
+            style={{
+              backgroundImage:
+                'repeating-conic-gradient(#d1d5db 0% 25%, #e5e7eb 0% 50%)',
+              backgroundSize: '8px 8px',
+            }}
+          />
+
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                <span className="text-sm font-bold text-gray-900 truncate">Your Name</span>
+                <span className="text-xs text-gray-500 truncate">@yourhandle · 1h</span>
+              </div>
+              {/* Edit + Copy buttons + decorative ••• */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={onEdit}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                    isEditing
+                      ? 'bg-gray-900 text-white border-gray-900 font-semibold'
+                      : 'text-gray-500 border-gray-200 hover:bg-gray-50 hover:border-gray-300'
+                  }`}
+                >
+                  {isEditing ? 'Editing…' : 'Edit'}
+                </button>
+                {/* Copy button — copies full tweet thread + hashtags to clipboard */}
+                <button
+                  onClick={handleCopy}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                    copied
+                      ? 'bg-green-50 text-green-600 border-green-200 font-semibold'
+                      : 'text-gray-500 border-gray-200 hover:bg-gray-50 hover:border-gray-300'
+                  }`}
+                >
+                  {copied ? '✓ Copied' : 'Copy'}
+                </button>
+                <span className="text-gray-400 text-base font-bold leading-none select-none" aria-hidden>•••</span>
+              </div>
+            </div>
+
+            {/* ── Tweet text ────────────────────────────────────────────── */}
+            {/* Thread tweets separated by a thin divider */}
+            <div className="mt-2 space-y-3">
+              {tweets.map((tweet, i) => (
+                <p key={i} className="text-sm text-gray-900 leading-relaxed whitespace-pre-wrap">
+                  {tweet}
+                </p>
+              ))}
+            </div>
+
+            {/* Hashtags in Twitter blue */}
+            {hashtags.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {hashtags.map((h) => (
+                  <span key={h} className="text-sm text-[#1d9bf0] font-medium">#{h}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Engagement stats (decorative) ─────────────────────────────────── */}
+      <div className="px-4 py-2.5 border-t border-gray-100 flex items-center gap-5 text-xs text-gray-500">
+        <span><strong className="text-gray-800 font-semibold">3,290</strong> Reposts</span>
+        <span><strong className="text-gray-800 font-semibold">1,234</strong> Quotes</span>
+        <span><strong className="text-gray-800 font-semibold">15.6K</strong> Likes</span>
+        <span><strong className="text-gray-800 font-semibold">73K</strong> Views</span>
+      </div>
+
+      {/* ── Action icons (decorative) ─────────────────────────────────────── */}
+      <div className="px-4 py-2 border-t border-gray-100 flex items-center justify-around text-gray-400">
+        {/* Reply */}
+        <button className="p-2 rounded-full hover:bg-[#1d9bf0]/10 hover:text-[#1d9bf0] transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
+        {/* Repost */}
+        <button className="p-2 rounded-full hover:bg-green-500/10 hover:text-green-500 transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/>
+          </svg>
+        </button>
+        {/* Like */}
+        <button className="p-2 rounded-full hover:bg-red-500/10 hover:text-red-500 transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+          </svg>
+        </button>
+        {/* Bookmark */}
+        <button className="p-2 rounded-full hover:bg-[#1d9bf0]/10 hover:text-[#1d9bf0] transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
+        {/* Share */}
+        <button className="p-2 rounded-full hover:bg-[#1d9bf0]/10 hover:text-[#1d9bf0] transition-colors">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+            <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+          </svg>
         </button>
       </div>
     </div>
@@ -763,8 +1094,8 @@ function EditPanel({
       {/* Panel header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
         <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">
-          {editingPost === 'linkedin' ? 'Editing: LinkedIn'
-           : editingPost === 'x'        ? 'Editing: X / Twitter'
+          {editingPost?.type === 'linkedin' ? 'Editing: LinkedIn'
+           : editingPost?.type === 'x'      ? 'Editing: X / Twitter'
            : 'Edit Area for Posts'}
         </h2>
         {editingPost && (
@@ -842,7 +1173,7 @@ function EditPanel({
             </div>
 
             {/* ── Manual editor ─────────────────────────────────────────────── */}
-            {editingPost === 'linkedin' ? (
+            {editingPost?.type === 'linkedin' ? (
               <LinkedInEditor
                 body={linkedIn.body}
                 hashtags={linkedIn.hashtags}

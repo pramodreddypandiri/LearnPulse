@@ -242,18 +242,48 @@ export interface LearningCluster {
 // Produced by: src/app/api/generate/route.ts → src/lib/ai/post-generator.ts
 // Consumed by: UI components (PostPreview, CopyButton)
 //
-// The final output of the pipeline — the two social media posts.
+// The final output of the pipeline — multiple LinkedIn posts (one per cluster)
+// and one X/Twitter post.
+
+/**
+ * A single LinkedIn post generated from one learning cluster.
+ *
+ * WHY ONE POST PER CLUSTER?
+ *   Each cluster represents a distinct learning journey (e.g., "Async Python"
+ *   and "React Performance" are two different topics). Generating one post per
+ *   cluster gives the user a choice of which journey to share — rather than
+ *   forcing the AI to pick one and mash them together.
+ *
+ * ORDERING:
+ *   Posts are ordered by cluster depth: deep → moderate → surface.
+ *   The deepest engagement (most queries + URL visits) produces the most
+ *   interesting post, so it comes first.
+ *
+ * EXTRA VERSIONS:
+ *   If fewer than 3 clusters exist, the highest-depth cluster generates
+ *   additional posts from different writing angles (see post-generator.ts)
+ *   so the user always has at least 3 LinkedIn posts to choose from.
+ */
+export interface LinkedInPost {
+  /** The main body text of the post (no hashtags) */
+  body: string;
+  /** Hashtags to append (3-5 items, without the # prefix) */
+  hashtags: string[];
+  /** Total character count of body + hashtags */
+  characterCount: number;
+  /** ID of the LearningCluster this post was generated from */
+  clusterId: string;
+  /** Human-readable cluster name — shown as a subtitle on the post card */
+  clusterName: string;
+}
 
 export interface GeneratedPosts {
-  /** LinkedIn post — professional, narrative, 150-300 words */
-  linkedin: {
-    /** The main body text of the post (no hashtags) */
-    body: string;
-    /** Hashtags to append (3-5 items, without the # prefix) */
-    hashtags: string[];
-    /** Total character count of body + hashtags */
-    characterCount: number;
-  };
+  /**
+   * LinkedIn posts — one per learning cluster, ordered deepest-first.
+   * Minimum 3 posts guaranteed (extra versions generated if fewer clusters).
+   * Maximum 4 posts (capped to avoid overwhelming the UI).
+   */
+  linkedinPosts: LinkedInPost[];
 
   /** X/Twitter post — punchy, conversational, 1-3 tweets */
   x: {
